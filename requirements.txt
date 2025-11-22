@@ -7,3 +7,6 @@ feedparser
 requests
 numpy
 pytz
+plotly
+fredapi
+beautifulsoup4
