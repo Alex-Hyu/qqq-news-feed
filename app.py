@@ -3,144 +3,171 @@ import yfinance as yf
 import pandas as pd
 from transformers import pipeline
 import datetime
+import feedparser
+import time
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="QQQ Market Pulse", layout="wide", page_icon="📈")
+st.set_page_config(page_title="QQQ Super Feed", layout="wide", page_icon="🦅")
 
-# --- CACHED FUNCTIONS (Speed up performance) ---
+# --- CACHED FUNCTIONS ---
 @st.cache_resource
 def load_sentiment_model():
-    """Loads the FinBERT model once to avoid reloading on every click."""
+    """Loads the FinBERT model once."""
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-@st.cache_data(ttl=300)  # Cache data for 5 minutes
+@st.cache_data(ttl=300)
 def get_news():
-    """Fetches news for QQQ and major Macro indicators from Yahoo Finance."""
-    tickers = ["QQQ", "SPY", "^TNX", "NVDA", "AAPL", "MSFT"] # Tech & Macro focus
+    """Fetches news from Yahoo Finance (Stocks) AND RSS Feeds (Macro Economy)."""
     all_news = []
-    
+
+    # SOURCE 1: Yahoo Finance (Targeted Tech Stocks)
+    tickers = ["QQQ", "NVDA", "AAPL", "MSFT", "^TNX"] # ^TNX is 10-Year Yield
     for ticker in tickers:
         try:
             stock = yf.Ticker(ticker)
             news = stock.news
             for item in news:
+                publish_time = datetime.datetime.fromtimestamp(item['providerPublishTime'])
                 all_news.append({
                     "Title": item['title'],
                     "Link": item['link'],
-                    "Publisher": item['publisher'],
-                    "Time": datetime.datetime.fromtimestamp(item['providerPublishTime']),
-                    "Related": ticker
+                    "Source": item['publisher'],
+                    "Time": publish_time,
+                    "Type": "Stock Specific"
                 })
         except Exception:
             continue
-            
-    # Remove duplicates based on Title
+
+    # SOURCE 2: RSS Feeds (Macro Economy)
+    rss_feeds = [
+        ("CNBC Economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
+        ("MarketWatch Top", "http://feeds.marketwatch.com/marketwatch/topstories/")
+    ]
+
+    for source_name, url in rss_feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]: # Get top 5 from each
+                # Parse time (struct_time to datetime)
+                if hasattr(entry, 'published_parsed'):
+                    dt = datetime.datetime.fromtimestamp(time.mktime(entry.published_parsed))
+                else:
+                    dt = datetime.datetime.now()
+
+                all_news.append({
+                    "Title": entry.title,
+                    "Link": entry.link,
+                    "Source": source_name,
+                    "Time": dt,
+                    "Type": "Macro Economy"
+                })
+        except Exception:
+            continue
+
+    # Deduplicate and Sort
     df = pd.DataFrame(all_news)
     if not df.empty:
-        df = df.drop_duplicates(subset=['Title']).sort_values(by="Time", ascending=False)
+        df = df.drop_duplicates(subset=['Title'])
+        df = df.sort_values(by="Time", ascending=False)
     return df
 
-def analyze_qqq_impact(headline, sentiment_label, sentiment_score):
-    """
-    Applies specific logic for the Nasdaq-100 (Tech).
-    """
+def analyze_qqq_impact(headline, sentiment_label):
+    """Applies QQQ Logic."""
     headline_lower = headline.lower()
     
-    # 1. YIELD / RATES LOGIC (The enemy of QQQ)
-    if "yield" in headline_lower or "treasury" in headline_lower or "rate" in headline_lower:
-        if "high" in headline_lower or "jump" in headline_lower or "rise" in headline_lower:
-            return "Bearish (Rates Up)"
-        elif "fall" in headline_lower or "drop" in headline_lower or "cut" in headline_lower:
-            return "Bullish (Rates Down)"
+    # Macro Rules
+    if "fed" in headline_lower or "rates" in headline_lower:
+        if "hike" in headline_lower or "raise" in headline_lower: return "Bearish (Rates)"
+        if "cut" in headline_lower or "pivot" in headline_lower: return "Bullish (Rates)"
+    
+    if "inflation" in headline_lower or "cpi" in headline_lower:
+        if "hot" in headline_lower or "rise" in headline_lower: return "Bearish (Inflation)"
+        if "cool" in headline_lower or "fall" in headline_lower: return "Bullish (Inflation)"
 
-    # 2. INFLATION LOGIC
-    if "cpi" in headline_lower or "inflation" in headline_lower:
-        if "hot" in headline_lower or "rise" in headline_lower:
-            return "Bearish (Inflation Risk)"
-        if "cool" in headline_lower or "fall" in headline_lower:
-            return "Bullish (Fed Pivot Hope)"
-
-    # 3. DEFAULT SENTIMENT MAPPING
-    # If sentiment is Positive, usually good for QQQ, unless it's "Economy too hot" logic
-    if sentiment_label == "positive":
-        return "Bullish"
-    elif sentiment_label == "negative":
-        return "Bearish"
-    else:
-        return "Neutral"
+    # Default AI
+    if sentiment_label == "positive": return "Bullish"
+    if sentiment_label == "negative": return "Bearish"
+    return "Neutral"
 
 # --- MAIN APP UI ---
-st.title("🦅 QQQ Macro & News Feed")
-st.markdown("Aggregating news from **Nasdaq-100, 10Y Yields, and Fed Policy**.")
+st.title("🦅 QQQ Super Feed")
+st.markdown("Tracking **Nasdaq-100**, **Fed Policy**, and **Global Economy**.")
 
-# Load Model (Show spinner first time)
-with st.spinner("Loading AI Models..."):
+# Load AI
+with st.spinner("Waking up AI..."):
     sentiment_pipe = load_sentiment_model()
 
+# Refresh Button
+if st.button("Refresh News"):
+    st.cache_data.clear()
+
 # Fetch Data
-with st.spinner("Fetching latest market news..."):
+with st.spinner("Scanning market news sources..."):
     df_news = get_news()
 
 if df_news.empty:
-    st.warning("No news found at the moment. Markets might be quiet.")
+    st.warning("No news found right now.")
 else:
-    # Run Analysis
     results = []
-    progress_bar = st.progress(0)
-    total = len(df_news)
+    # Analyze top 20 articles
+    df_process = df_news.head(20)
     
-    # Limit to top 15 latest articles to save speed
-    df_process = df_news.head(15)
-    
+    # Progress bar for AI processing
+    progress_text = "AI is reading headlines..."
+    my_bar = st.progress(0, text=progress_text)
+
     for i, row in df_process.iterrows():
-        # AI Sentiment Analysis
-        # We take the first 512 chars to fit BERT limits
-        output = sentiment_pipe(row['Title'][:512])[0]
-        label = output['label']
-        score = output['score']
-        
-        # Apply QQQ Specific Logic
-        qqq_signal = analyze_qqq_impact(row['Title'], label, score)
-        
-        results.append({
-            "Time": row['Time'].strftime("%H:%M"),
-            "Headline": row['Title'],
-            "Source": row['Publisher'],
-            "Link": row['Link'],
-            "AI Sentiment": label,
-            "QQQ Impact": qqq_signal
-        })
-        progress_bar.progress((i + 1) / len(df_process))
-    
-    progress_bar.empty()
+        # AI Analysis
+        try:
+            output = sentiment_pipe(row['Title'][:512])[0]
+            label = output['label']
+            impact = analyze_qqq_impact(row['Title'], label)
+            
+            results.append({
+                "Headline": row['Title'],
+                "Source": row['Source'],
+                "Link": row['Link'],
+                "QQQ Signal": impact,
+                "Type": row['Type']
+            })
+        except Exception:
+            pass
+        my_bar.progress((i + 1) / len(df_process), text=progress_text)
+
+    my_bar.empty()
     df_results = pd.DataFrame(results)
 
-    # --- DASHBOARD HEADER ---
+    # METRICS
     st.divider()
+    bulls = len(df_results[df_results['QQQ Signal'].str.contains("Bullish")])
+    bears = len(df_results[df_results['QQQ Signal'].str.contains("Bearish")])
     
-    # Score Calculation
-    bulls = len(df_results[df_results['QQQ Impact'].str.contains("Bullish")])
-    bears = len(df_results[df_results['QQQ Impact'].str.contains("Bearish")])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bullish News", bulls)
+    c2.metric("Bearish News", bears)
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Bullish Signals", bulls)
-    col2.metric("Bearish Signals", bears)
-    
-    sentiment_diff = bulls - bears
-    if sentiment_diff > 2:
-        col3.success("Overall Outlook: **BULLISH**")
-    elif sentiment_diff < -2:
-        col3.error("Overall Outlook: **BEARISH**")
+    if bulls > bears:
+        c3.success("Market Mood: **RISK ON**")
+    elif bears > bulls:
+        c3.error("Market Mood: **RISK OFF**")
     else:
-        col3.info("Overall Outlook: **NEUTRAL / MIXED**")
-
+        c3.info("Market Mood: **NEUTRAL**")
+        
     st.divider()
 
-    # --- NEWS FEED DISPLAY ---
-    st.subheader("Latest Analysis")
+    # TABS FOR VIEWING
+    tab1, tab2 = st.tabs(["All News", "Macro Only"])
     
-    for idx, row in df_results.iterrows():
-        with st.expander(f"{row['QQQ Impact']} | {row['Headline']}"):
-            st.write(f"**Source:** {row['Source']} at {row['Time']}")
-            st.write(f"**Base AI Sentiment:** {row['AI Sentiment']}")
-            st.markdown(f"[Read Article]({row['Link']})")
+    with tab1:
+        for idx, row in df_results.iterrows():
+            color = "green" if "Bullish" in row['QQQ Signal'] else "red" if "Bearish" in row['QQQ Signal'] else "gray"
+            with st.expander(f":{color}[{row['QQQ Signal']}] | {row['Headline']}"):
+                st.write(f"**Source:** {row['Source']} ({row['Type']})")
+                st.markdown(f"[Read Story]({row['Link']})")
+
+    with tab2:
+        macro_df = df_results[df_results['Type'] == "Macro Economy"]
+        for idx, row in macro_df.iterrows():
+             with st.expander(f"{row['QQQ Signal']} | {row['Headline']}"):
+                st.write(f"**Source:** {row['Source']}")
+                st.markdown(f"[Read Story]({row['Link']})")
