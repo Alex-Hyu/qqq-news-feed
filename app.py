@@ -7,167 +7,155 @@ import feedparser
 import time
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="QQQ Super Feed", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="QQQ Pro Feed", layout="wide", page_icon="🦅")
 
 # --- CACHED FUNCTIONS ---
 @st.cache_resource
 def load_sentiment_model():
-    """Loads the FinBERT model once."""
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 @st.cache_data(ttl=300)
-def get_news():
-    """Fetches news from Yahoo Finance (Stocks) AND RSS Feeds (Macro Economy)."""
-    all_news = []
+def get_market_data():
+    """Fetches Prices AND News."""
+    # 1. Get Live Prices
+    tickers = ["QQQ", "^TNX", "^VIX"]
+    price_data = {}
+    try:
+        data = yf.download(tickers, period="2d", progress=False)['Close']
+        # Handle multi-index columns if necessary (yfinance update quirks)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel(0) # Flatten if needed
+            
+        for ticker in tickers:
+            try:
+                # Calculate % change
+                prev = data[ticker].iloc[-2] # Yesterday close
+                curr = data[ticker].iloc[-1] # Today current
+                pct = ((curr - prev) / prev) * 100
+                price_data[ticker] = pct
+            except:
+                price_data[ticker] = 0.0
+    except:
+        price_data = {"QQQ": 0.0, "^TNX": 0.0, "^VIX": 0.0}
 
-    # SOURCE 1: Yahoo Finance (Targeted Tech Stocks)
-    tickers = ["QQQ", "NVDA", "AAPL", "MSFT", "^TNX"] # ^TNX is 10-Year Yield
-    for ticker in tickers:
+    # 2. Get News (Yahoo + RSS)
+    all_news = []
+    
+    # Yahoo News (Tech Focus)
+    stock_tickers = ["QQQ", "NVDA", "AAPL", "MSFT"]
+    for t in stock_tickers:
         try:
-            stock = yf.Ticker(ticker)
-            news = stock.news
-            for item in news:
-                publish_time = datetime.datetime.fromtimestamp(item['providerPublishTime'])
+            stock = yf.Ticker(t)
+            for item in stock.news:
                 all_news.append({
                     "Title": item['title'],
                     "Link": item['link'],
                     "Source": item['publisher'],
-                    "Time": publish_time,
-                    "Type": "Stock Specific"
+                    "Time": datetime.datetime.fromtimestamp(item['providerPublishTime']),
+                    "Type": "Stock"
                 })
-        except Exception:
-            continue
+        except: pass
 
-    # SOURCE 2: RSS Feeds (Macro Economy)
-    rss_feeds = [
+    # RSS (Macro)
+    feeds = [
         ("CNBC Economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
-        ("MarketWatch Top", "http://feeds.marketwatch.com/marketwatch/topstories/")
+        ("MarketWatch", "http://feeds.marketwatch.com/marketwatch/topstories/")
     ]
-
-    for source_name, url in rss_feeds:
+    for name, url in feeds:
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]: # Get top 5 from each
-                # Parse time (struct_time to datetime)
-                if hasattr(entry, 'published_parsed'):
-                    dt = datetime.datetime.fromtimestamp(time.mktime(entry.published_parsed))
-                else:
-                    dt = datetime.datetime.now()
-
+            f = feedparser.parse(url)
+            for e in f.entries[:5]:
                 all_news.append({
-                    "Title": entry.title,
-                    "Link": entry.link,
-                    "Source": source_name,
-                    "Time": dt,
-                    "Type": "Macro Economy"
+                    "Title": e.title,
+                    "Link": e.link,
+                    "Source": name,
+                    "Time": datetime.datetime.now(), # Approx
+                    "Type": "Macro"
                 })
-        except Exception:
-            continue
-
-    # Deduplicate and Sort
-    df = pd.DataFrame(all_news)
-    if not df.empty:
-        df = df.drop_duplicates(subset=['Title'])
-        df = df.sort_values(by="Time", ascending=False)
-    return df
+        except: pass
+        
+    df_news = pd.DataFrame(all_news)
+    if not df_news.empty:
+        df_news = df_news.drop_duplicates(subset=['Title']).sort_values(by="Time", ascending=False)
+        
+    return price_data, df_news
 
 def analyze_qqq_impact(headline, sentiment_label):
-    """Applies QQQ Logic."""
-    headline_lower = headline.lower()
+    h = headline.lower()
+    # Specialized Logic
+    if "fed" in h or "powell" in h:
+        if "hike" in h or "caution" in h: return "Bearish (Fed Fear)"
+        if "cut" in h or "dove" in h: return "Bullish (Fed Hope)"
+    if "inflation" in h or "cpi" in h:
+        if "rise" in h or "hot" in h: return "Bearish (Inflation)"
+        if "fall" in h or "cool" in h: return "Bullish (Disinflation)"
+    if "yield" in h and "jump" in h: return "Bearish (Rates)"
     
-    # Macro Rules
-    if "fed" in headline_lower or "rates" in headline_lower:
-        if "hike" in headline_lower or "raise" in headline_lower: return "Bearish (Rates)"
-        if "cut" in headline_lower or "pivot" in headline_lower: return "Bullish (Rates)"
-    
-    if "inflation" in headline_lower or "cpi" in headline_lower:
-        if "hot" in headline_lower or "rise" in headline_lower: return "Bearish (Inflation)"
-        if "cool" in headline_lower or "fall" in headline_lower: return "Bullish (Inflation)"
-
-    # Default AI
+    # Fallback to AI
     if sentiment_label == "positive": return "Bullish"
     if sentiment_label == "negative": return "Bearish"
     return "Neutral"
 
-# --- MAIN APP UI ---
-st.title("🦅 QQQ Super Feed")
-st.markdown("Tracking **Nasdaq-100**, **Fed Policy**, and **Global Economy**.")
+# --- MAIN APP ---
+st.title("🦅 QQQ Alpha-Seeker")
 
-# Load AI
-with st.spinner("Waking up AI..."):
+with st.spinner("Analyzing Market Conditions..."):
+    prices, df_news = get_market_data()
     sentiment_pipe = load_sentiment_model()
 
-# Refresh Button
-if st.button("Refresh News"):
-    st.cache_data.clear()
+# 1. DASHBOARD (THE REALITY CHECK)
+st.subheader("Market Reality Check")
+col1, col2, col3 = st.columns(3)
 
-# Fetch Data
-with st.spinner("Scanning market news sources..."):
-    df_news = get_news()
+# QQQ Logic
+q_val = prices.get("QQQ", 0)
+q_color = "normal" if -0.5 < q_val < 0.5 else "inverse"
+col1.metric("QQQ Price", f"{q_val:.2f}%", delta_color=q_color)
 
-if df_news.empty:
-    st.warning("No news found right now.")
-else:
-    results = []
-    # Analyze top 20 articles
-    df_process = df_news.head(20)
+# 10Y Yield Logic (Inverted: Yield UP is BAD for Tech)
+t_val = prices.get("^TNX", 0)
+col2.metric("10Y Yield", f"{t_val:.2f}%", delta_color="inverse")
+
+# VIX Logic (Inverted: Volatility UP is BAD)
+v_val = prices.get("^VIX", 0)
+col3.metric("VIX (Fear Index)", f"{v_val:.2f}%", delta_color="inverse")
+
+st.divider()
+
+# 2. NEWS ANALYSIS
+results = []
+if not df_news.empty:
+    bar = st.progress(0, "AI Reading Headlines...")
+    subset = df_news.head(15)
     
-    # Progress bar for AI processing
-    progress_text = "AI is reading headlines..."
-    my_bar = st.progress(0, text=progress_text)
-
-    for i, row in df_process.iterrows():
-        # AI Analysis
+    for i, row in subset.iterrows():
         try:
-            output = sentiment_pipe(row['Title'][:512])[0]
-            label = output['label']
-            impact = analyze_qqq_impact(row['Title'], label)
-            
-            results.append({
-                "Headline": row['Title'],
-                "Source": row['Source'],
-                "Link": row['Link'],
-                "QQQ Signal": impact,
-                "Type": row['Type']
-            })
-        except Exception:
-            pass
-        my_bar.progress((i + 1) / len(df_process), text=progress_text)
-
-    my_bar.empty()
-    df_results = pd.DataFrame(results)
-
-    # METRICS
-    st.divider()
-    bulls = len(df_results[df_results['QQQ Signal'].str.contains("Bullish")])
-    bears = len(df_results[df_results['QQQ Signal'].str.contains("Bearish")])
+            out = sentiment_pipe(row['Title'][:512])[0]
+            impact = analyze_qqq_impact(row['Title'], out['label'])
+            results.append({**row, "Signal": impact})
+        except: pass
+        bar.progress((i+1)/len(subset))
     
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Bullish News", bulls)
-    c2.metric("Bearish News", bears)
+    bar.empty()
+    df_res = pd.DataFrame(results)
     
-    if bulls > bears:
-        c3.success("Market Mood: **RISK ON**")
-    elif bears > bulls:
-        c3.error("Market Mood: **RISK OFF**")
+    # Divergence Warning
+    bull_count = len(df_res[df_res['Signal'].str.contains("Bullish")])
+    bear_count = len(df_res[df_res['Signal'].str.contains("Bearish")])
+    
+    st.subheader("Sentiment vs. Price")
+    
+    # Logic: If News says Buy, but Price says Sell
+    if bull_count > bear_count and q_val < -0.3:
+        st.error(f"🚨 DIVERGENCE ALERT: News is Bullish ({bull_count} articles), but QQQ is Red ({q_val:.2f}%). Beware of 'Bull Trap'.")
+    elif bear_count > bull_count and q_val > 0.3:
+        st.success(f"🚀 STRENGTH ALERT: News is Bearish ({bear_count} articles), but QQQ is Green ({q_val:.2f}%). Market is ignoring bad news (Very Bullish).")
     else:
-        c3.info("Market Mood: **NEUTRAL**")
-        
-    st.divider()
+        st.info("Sentiment aligns with Price Action.")
 
-    # TABS FOR VIEWING
-    tab1, tab2 = st.tabs(["All News", "Macro Only"])
-    
-    with tab1:
-        for idx, row in df_results.iterrows():
-            color = "green" if "Bullish" in row['QQQ Signal'] else "red" if "Bearish" in row['QQQ Signal'] else "gray"
-            with st.expander(f":{color}[{row['QQQ Signal']}] | {row['Headline']}"):
-                st.write(f"**Source:** {row['Source']} ({row['Type']})")
-                st.markdown(f"[Read Story]({row['Link']})")
-
-    with tab2:
-        macro_df = df_results[df_results['Type'] == "Macro Economy"]
-        for idx, row in macro_df.iterrows():
-             with st.expander(f"{row['QQQ Signal']} | {row['Headline']}"):
-                st.write(f"**Source:** {row['Source']}")
-                st.markdown(f"[Read Story]({row['Link']})")
+    # Display Feed
+    for i, row in df_res.iterrows():
+        icon = "🟢" if "Bullish" in row['Signal'] else "🔴" if "Bearish" in row['Signal'] else "⚪"
+        with st.expander(f"{icon} {row['Signal']} | {row['Title']}"):
+            st.caption(f"Source: {row['Source']}")
+            st.markdown(f"[Read Article]({row['Link']})")
