@@ -6,3 +6,4 @@ torch
 feedparser
 requests
 beautifulsoup4
+numpy
