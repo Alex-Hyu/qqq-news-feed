@@ -4,3 +4,5 @@ yfinance
 transformers
 torch
 feedparser
+requests
+beautifulsoup4
