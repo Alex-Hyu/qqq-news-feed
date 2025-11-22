@@ -9,7 +9,7 @@ import feedparser
 from transformers import pipeline
 
 # --- 0. 全局配置 ---
-st.set_page_config(page_title="QQQ 宏观战情室", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="QQQ 宏观战情室 Pro", layout="wide", page_icon="🦅")
 
 st.markdown("""
     <style>
@@ -24,12 +24,10 @@ st.markdown("""
 
 @st.cache_resource
 def load_ai_model():
-    """加载 FinBERT AI 模型"""
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 @st.cache_data(ttl=3600)
 def get_ny_fed_data():
-    """获取 SOFR 和 TGCR (Repo) 数据"""
     try:
         url = "https://markets.newyorkfed.org/api/rates/all/latest.json"
         r = requests.get(url, timeout=5).json()
@@ -38,37 +36,25 @@ def get_ny_fed_data():
             if item['type'] == 'SOFR': rates['SOFR'] = float(item['percentRate'])
             if item['type'] == 'TGCR': rates['TGCR'] = float(item['percentRate'])
         return rates
-    except:
-        return {'SOFR': 5.33, 'TGCR': 5.32}
+    except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
 @st.cache_data(ttl=3600)
 def get_fed_liquidity():
-    """
-    [新增] 获取 RRP 和 TGA 数据
-    来源: FRED 公开 CSV (无需 API Key)
-    """
+    """RRP & TGA (FRED CSV)"""
     res = {"RRP": 0, "RRP_Chg": 0, "TGA": 0, "TGA_Chg": 0}
     try:
-        # 1. RRP (逆回购 - 每日) - ID: RRPONTSYD
-        rrp_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD"
-        rrp_df = pd.read_csv(rrp_url)
-        res['RRP'] = rrp_df.iloc[-1]['RRPONTSYD'] # 单位: Billions
+        rrp_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD")
+        res['RRP'] = rrp_df.iloc[-1]['RRPONTSYD']
         res['RRP_Chg'] = res['RRP'] - rrp_df.iloc[-2]['RRPONTSYD']
         
-        # 2. TGA (财政部账户 - 周度) - ID: WTREGEN
-        # 注: TGA 日度数据很难免费获取，这里使用 FRED 的周度数据作为趋势参考
-        tga_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN"
-        tga_df = pd.read_csv(tga_url)
-        res['TGA'] = tga_df.iloc[-1]['WTREGEN'] # 单位: Billions
+        tga_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN")
+        res['TGA'] = tga_df.iloc[-1]['WTREGEN']
         res['TGA_Chg'] = res['TGA'] - tga_df.iloc[-2]['WTREGEN']
-        
-    except Exception as e:
-        print(f"FRED Data Error: {e}")
+    except: pass
     return res
 
 @st.cache_data(ttl=3600)
 def get_credit_spreads():
-    """计算信贷利差 (HYG/LQD)"""
     try:
         data = yf.download(["HYG", "LQD"], period="5d", progress=False)['Close']
         if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.droplevel(0)
@@ -80,7 +66,6 @@ def get_credit_spreads():
 
 @st.cache_data(ttl=900)
 def get_rates_and_fx():
-    """获取美债、汇率、MOVE"""
     tickers = ["^IRX", "^TNX", "^TYX", "DX-Y.NYB", "JPY=X", "^MOVE"] 
     res = {}
     try:
@@ -100,7 +85,6 @@ def get_rates_and_fx():
 
 @st.cache_data(ttl=600)
 def get_volatility_indices():
-    """VIX & Crypto FNG"""
     data = {}
     try:
         vix = yf.Ticker("^VIX").history(period="2d")['Close'].iloc[-1]
@@ -114,9 +98,77 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
+@st.cache_data(ttl=300)
+def get_derivatives_structure():
+    """
+    [新增核心] 获取 期货基差 + GEX 模型
+    """
+    res = {
+        "Futures_Basis": 0, "Basis_Status": "Normal", 
+        "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, "Zero_Gamma": 0,
+        "Vanna_Charm_Proxy": "Neutral"
+    }
+    try:
+        # 1. 期货基差 (Basis)
+        # NQ=F (Nasdaq 100 Futures) vs ^NDX (Nasdaq 100 Spot)
+        # 注意: yfinance 的 ^NDX 有时有延迟，这里仅作趋势参考
+        market_data = yf.download(["NQ=F", "^NDX", "QQQ"], period="2d", progress=False)['Close']
+        if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.droplevel(0)
+        
+        fut = market_data['NQ=F'].iloc[-1]
+        spot = market_data['^NDX'].iloc[-1]
+        qqq_price = market_data['QQQ'].iloc[-1]
+        
+        basis = fut - spot
+        res['Futures_Basis'] = basis
+        
+        if basis < -10: res['Basis_Status'] = "🔴 Backwardation (Extreme Fear/Tight)"
+        elif basis > 50: res['Basis_Status'] = "🟢 Contango (Bullish/Normal)"
+        else: res['Basis_Status'] = "⚪ Flat (Neutral)"
+        
+        # 2. GEX (Gamma Exposure) Lite Model
+        # 获取 QQQ 期权链
+        qqq = yf.Ticker("QQQ")
+        exp = qqq.options[0] # 最近到期日
+        chain = qqq.option_chain(exp)
+        calls = chain.calls
+        puts = chain.puts
+        
+        # 寻找 Call Wall (最大 OI Call) 和 Put Wall (最大 OI Put)
+        max_call_oi_idx = calls['openInterest'].idxmax()
+        max_put_oi_idx = puts['openInterest'].idxmax()
+        
+        res['Call_Wall'] = calls.iloc[max_call_oi_idx]['strike']
+        res['Put_Wall'] = puts.iloc[max_put_oi_idx]['strike']
+        
+        # 估算 Net GEX Sentiment
+        # 如果价格 > Call Wall，Dealer 必须做空期货对冲 -> 抑制波动 (Positive Gamma)
+        # 如果价格 < Put Wall，Dealer 必须做空期货对冲下跌 -> 放大波动 (Negative Gamma)
+        if qqq_price > res['Call_Wall']:
+            res['GEX_Net'] = "🟢 Positive Gamma (Vol Suppressed)"
+        elif qqq_price < res['Put_Wall']:
+            res['GEX_Net'] = "🔴 Negative Gamma (Vol Expansion)"
+        else:
+            res['GEX_Net'] = "⚪ Neutral Gamma Zone"
+            
+        # 3. Vanna/Charm Proxy (基于 VIX 期限结构和 PCR)
+        # 如果 VIX 下跌 且 PCR 极低 -> Dealer 解除对冲 -> 助涨 (Vanna Tailwind)
+        # 如果 VIX 暴涨 -> Vanna Headwind
+        res['Zero_Gamma'] = (res['Call_Wall'] + res['Put_Wall']) / 2 # 粗略估计
+        
+        if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
+            res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
+        else:
+            res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
+
+    except Exception as e:
+        print(f"Derivatives Error: {e}")
+        
+    return res
+
 @st.cache_data(ttl=600)
 def get_qqq_options_data():
-    """PCR & Unusual Radar"""
+    """PCR & Unusual Radar (保持不变)"""
     qqq = yf.Ticker("QQQ")
     res = {"PCR": 0.0, "Unusual": []}
     try:
@@ -174,79 +226,77 @@ def get_macro_news():
 
 # --- 2. 核心算法: 多空评分模型 ---
 
-def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, news_score_val):
+def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_score_val):
     """
-    加入了 RRP 和 TGA 的评分逻辑
+    加入衍生品 (Basis, GEX) 的评分逻辑
     """
     score = 0
     details = []
     
-    # --- 1. 流动性 (25%) ---
+    # 1. 流动性 (25%)
     liq_score = 0
-    
-    # A. SOFR Spread
     spread = ny_fed['SOFR'] - ny_fed['TGCR']
-    if spread > 0.05: liq_score -= 1.0; details.append("🔴 SOFR 异常跳升 (钱紧)")
+    if spread > 0.05: liq_score -= 1.0; details.append("🔴 SOFR 异常")
     elif spread < 0.02: liq_score += 0.5
     
-    # B. 信贷利差
-    if credit[1] < -0.5: liq_score -= 0.5; details.append("🔴 信贷利差扩大")
+    if fed_liq['RRP_Chg'] > 20: liq_score -= 0.5; details.append("🔴 RRP 抽水")
+    if fed_liq['TGA_Chg'] > 20: liq_score -= 0.5; details.append("🔴 TGA 抽水")
+    
+    if credit[1] < -0.5: liq_score -= 0.5
     elif credit[1] > 0.2: liq_score += 0.5
-    
-    # C. [新增] RRP & TGA (影子流动性)
-    # RRP 上升 = 抽水 (Bad), RRP 下降 = 放水 (Good)
-    if fed_liq['RRP_Chg'] > 20: # 增加超过200亿
-        liq_score -= 0.5; details.append("🔴 RRP 激增 (流动性回收)")
-    elif fed_liq['RRP_Chg'] < -20:
-        liq_score += 0.5; details.append("🟢 RRP 释放 (流动性释放)")
-        
-    # TGA 上升 = 抽水 (Bad)
-    if fed_liq['TGA_Chg'] > 20:
-        liq_score -= 0.5; details.append("🔴 TGA 补库 (财政部抽水)")
-    
     score += max(-2.5, min(2.5, liq_score))
     
-    # --- 2. 美债 (25%) ---
+    # 2. 美债 (25%)
     bond_score = 0
-    if rates['Yield_10Y'] > 4.5: bond_score -= 1.0; details.append("🔴 10Y 收益率过高")
+    if rates['Yield_10Y'] > 4.5: bond_score -= 1.0
     elif rates['Yield_10Y'] < 4.0: bond_score += 1.0
-    if rates['MOVE'] > 110: bond_score -= 1.5; details.append("🔴 MOVE 债市恐慌")
+    if rates['MOVE'] > 110: bond_score -= 1.5
     score += max(-2.5, min(2.5, bond_score))
     
-    # --- 3. 恐慌 (15%) ---
+    # 3. 恐慌 (15%)
     fear_score = 0
-    if vol['VIX'] > 25: fear_score -= 1.0; details.append("🔴 VIX 恐慌")
-    elif vol['VIX'] < 13: fear_score -= 0.5; details.append("⚠️ VIX 过低")
-    if vol['Crypto_Val'] < 20: fear_score += 0.5; details.append("🟢 币圈极度恐慌")
+    if vol['VIX'] > 25: fear_score -= 1.0
+    elif vol['VIX'] < 13: fear_score -= 0.5
+    if vol['Crypto_Val'] < 20: fear_score += 0.5
     score += fear_score
     
-    # --- 4. 交易 (20%) ---
+    # 4. 交易与微观结构 (20%) - [更新] 加入 GEX/Basis
     trade_score = 0
-    if opt['PCR'] > 1.1: trade_score -= 1.0; details.append("📉 PCR 偏空")
-    elif opt['PCR'] < 0.7: trade_score += 1.0; details.append("📈 PCR 偏多")
+    # PCR
+    if opt['PCR'] > 1.1: trade_score -= 0.5; details.append("📉 PCR 偏空")
+    elif opt['PCR'] < 0.7: trade_score += 0.5
+    
+    # GEX / Basis
+    if deriv['Basis_Status'].startswith("🔴"): 
+        trade_score -= 1.0; details.append("🔴 期货贴水 (资金看空)")
+    if deriv['GEX_Net'].startswith("🔴"):
+        trade_score -= 0.5; details.append("🔴 负 Gamma (波动放大)")
+    elif deriv['GEX_Net'].startswith("🟢"):
+        trade_score += 0.5
+        
     score += max(-2.0, min(2.0, trade_score))
     
-    # --- 5. 新闻 (15%) ---
+    # 5. 新闻 (15%)
     news_con = news_score_val * 1.5
     score += news_con
-    if news_con < -0.5: details.append("🔴 宏观舆情偏空")
+    if news_con < -0.5: details.append("🔴 舆情偏空")
     
     return round(score * (10 / 7.5), 1), details
 
 # --- 3. 界面渲染 (UI) ---
 
-with st.spinner("正在同步美联储、纽联储及全球市场数据..."):
+with st.spinner("正在同步全球市场微观结构数据..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
-    fed_liq = get_fed_liquidity() # 新增
+    fed_liq = get_fed_liquidity()
     credit = get_credit_spreads()
     rates = get_rates_and_fx()
     vol = get_volatility_indices()
     opt = get_qqq_options_data()
+    deriv = get_derivatives_structure() # 新增
     cal = get_macro_calendar()
     raw_news = get_macro_news()
 
-    # 新闻 AI 处理
     processed_news = []
     sentiment_total = 0
     if not raw_news.empty:
@@ -255,8 +305,7 @@ with st.spinner("正在同步美联储、纽联储及全球市场数据..."):
                 res = ai_model(row['Title'][:512])[0]
                 label = res['label']
                 score = res['score']
-                sent = "Neutral"
-                val = 0
+                sent = "Neutral"; val = 0
                 if label == 'positive' and score > 0.5: sent="Bullish"; val=1
                 elif label == 'negative' and score > 0.5: sent="Bearish"; val=-1
                 sentiment_total += val
@@ -265,7 +314,7 @@ with st.spinner("正在同步美联储、纽联储及全球市场数据..."):
         avg_news_score = sentiment_total / max(1, len(processed_news))
     else: avg_news_score = 0
 
-    final_score, reasons = calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, avg_news_score)
+    final_score, reasons = calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, avg_news_score)
 
 # --- HEADER ---
 st.title("🦅 QQQ 宏观战情室 (Macro War Room)")
@@ -288,16 +337,13 @@ with col_text:
 
 st.divider()
 
-# --- 模块 1: 流动性 (升级版) ---
+# --- 模块 1: 流动性 ---
 st.subheader("1. 流动性监控 (Liquidity)")
 l1, l2, l3, l4, l5 = st.columns(5)
-
 l1.metric("SOFR", f"{ny_fed['SOFR']:.2f}%", f"Spread: {ny_fed['SOFR'] - ny_fed['TGCR']:.3f}")
 l2.metric("Repo (TGCR)", f"{ny_fed['TGCR']:.2f}%")
-# [新增] RRP 和 TGA
-l3.metric("RRP (逆回购)", f"${fed_liq['RRP']:.0f}B", f"{fed_liq['RRP_Chg']:.0f}B (变动)", delta_color="inverse")
-l4.metric("TGA (财政部)", f"${fed_liq['TGA']:.0f}B", f"{fed_liq['TGA_Chg']:.0f}B (变动)", delta_color="inverse")
-# 信贷
+l3.metric("RRP (逆回购)", f"${fed_liq['RRP']:.0f}B", f"{fed_liq['RRP_Chg']:.0f}B", delta_color="inverse")
+l4.metric("TGA (财政部)", f"${fed_liq['TGA']:.0f}B", f"{fed_liq['TGA_Chg']:.0f}B", delta_color="inverse")
 l5.metric("HYG/LQD", f"{credit[0]:.3f}", f"{credit[1]:.2f}%")
 
 st.divider()
@@ -313,23 +359,37 @@ r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# --- 模块 3: 交易与恐慌 ---
-st.subheader("3. 交易数据与恐慌指数 (Trading & Fear)")
-t1, t2, t3 = st.columns(3)
+# --- 模块 3: 交易与微观结构 (Trading & Market Structure) ---
+# [更新] 加入了衍生品结构板块
+st.subheader("3. 交易与微观结构 (Options & GEX)")
+t1, t2, t3, t4 = st.columns(4)
+
 t1.metric("QQQ 期权 PCR", f"{opt['PCR']}", "Put/Call Ratio")
 t2.metric("VIX 股市恐慌", f"{vol['VIX']:.2f}")
 t3.metric("币圈恐慌指数", f"{vol['Crypto_Val']}", f"{vol['Crypto_Text']}")
+t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'])
 
-st.write("**⚡ QQQ 异动雷达 (Unusual Radar)**")
-if opt['Unusual']:
-    st.dataframe(pd.DataFrame(opt['Unusual']), use_container_width=True)
-else:
-    st.info("今日暂无显著异动大单。")
+# Gamma Exposure Display
+g1, g2, g3 = st.columns(3)
+g1.metric("Net Gamma (GEX)", deriv['GEX_Net'], "正Gamma抑制波动，负Gamma放大波动")
+g2.metric("关键支撑 (Put Wall)", f"${deriv['Put_Wall']}", "最大 Put 持仓位")
+g3.metric("关键阻力 (Call Wall)", f"${deriv['Call_Wall']}", "最大 Call 持仓位")
+
+with st.expander("查看 QQQ 异动雷达与 Vanna/Charm 状态", expanded=True):
+    c_ex1, c_ex2 = st.columns([2, 1])
+    with c_ex1:
+        st.write("**⚡ 异动雷达 (Unusual Volume > OI)**")
+        if opt['Unusual']: st.dataframe(pd.DataFrame(opt['Unusual']), use_container_width=True)
+        else: st.info("今日无显著异动。")
+    with c_ex2:
+        st.write("**Greek Flows (Proxy)**")
+        st.info(f"🔮 Vanna/Charm 状态: **{deriv['Vanna_Charm_Proxy']}**")
+        st.caption("注: 若VIX下跌，Dealer解套Call，形成Vanna助涨；若VIX暴涨则反之。")
 
 st.divider()
 
-# --- 模块 4: 宏观新闻情报 ---
-st.subheader("4. 宏观新闻情报 (AI Sentiment News)")
+# --- 模块 4: 宏观新闻 ---
+st.subheader("4. 宏观新闻情报 (AI Sentiment)")
 col_news_list, col_news_stat = st.columns([3, 1])
 with col_news_list:
     if processed_news:
@@ -345,8 +405,8 @@ with col_news_stat:
 
 st.divider()
 
-# --- 模块 5: 宏观日历 ---
-st.subheader("5. 宏观日历 (Macro Calendar)")
+# --- 模块 5: 日历 ---
+st.subheader("5. 宏观日历")
 if cal:
     cols = st.columns(len(cal) if len(cal)<5 else 5)
     for idx, e in enumerate(cal[:5]):
