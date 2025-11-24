@@ -7,6 +7,8 @@ import datetime
 import pytz
 import feedparser
 from transformers import pipeline
+# [新增] 引入自动刷新库
+from streamlit_autorefresh import st_autorefresh
 
 # --- 0. 全局配置 ---
 st.set_page_config(page_title="QQQ 宏观战情室 Pro", layout="wide", page_icon="🦅")
@@ -20,12 +22,25 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# --- [新增] 侧边栏自动刷新控制 ---
+with st.sidebar:
+    st.header("⚙️ 系统状态")
+    # 设置每 120 秒 (2分钟) 刷新一次
+    count = st_autorefresh(interval=120 * 1000, key="data_refresher")
+    st.caption(f"🟢 自动刷新已开启 (2分钟/次)")
+    st.caption(f"已刷新次数: {count}")
+    
+    # 添加一个手动刷新按钮方便调试
+    if st.button("🔄 立即手动刷新"):
+        st.rerun()
+
 # --- 1. 核心模型与数据获取 ---
 
 @st.cache_resource
 def load_ai_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
+# 宏观数据：每天更新一次，保持 1 小时缓存即可
 @st.cache_data(ttl=3600)
 def get_ny_fed_data():
     try:
@@ -38,6 +53,7 @@ def get_ny_fed_data():
         return rates
     except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
+# 宏观数据：每天更新一次
 @st.cache_data(ttl=3600)
 def get_fed_liquidity():
     """RRP & TGA (FRED CSV)"""
@@ -53,7 +69,8 @@ def get_fed_liquidity():
     except: pass
     return res
 
-@st.cache_data(ttl=3600)
+# 市场数据：改为 120秒 缓存，确保实时性
+@st.cache_data(ttl=120)
 def get_credit_spreads():
     try:
         data = yf.download(["HYG", "LQD"], period="5d", progress=False)['Close']
@@ -64,7 +81,8 @@ def get_credit_spreads():
         return curr, pct
     except: return 0, 0
 
-@st.cache_data(ttl=900)
+# 市场数据：改为 120秒 缓存
+@st.cache_data(ttl=120)
 def get_rates_and_fx():
     tickers = ["^IRX", "^TNX", "^TYX", "DX-Y.NYB", "JPY=X", "^MOVE"] 
     res = {}
@@ -83,7 +101,8 @@ def get_rates_and_fx():
         res = {'Yield_2Y':5.0, 'Yield_10Y':4.2, 'Yield_30Y':4.3, 'DXY':104, 'USDJPY':150, 'MOVE':100, 'Inversion':-0.8}
     return res
 
-@st.cache_data(ttl=600)
+# 市场数据：改为 120秒 缓存
+@st.cache_data(ttl=120)
 def get_volatility_indices():
     data = {}
     try:
@@ -98,20 +117,16 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-@st.cache_data(ttl=300)
+# 衍生品数据：改为 120秒 缓存 (GEX 需要跟随股价变动)
+@st.cache_data(ttl=120)
 def get_derivatives_structure():
-    """
-    [新增核心] 获取 期货基差 + GEX 模型
-    """
+    """获取 期货基差 + GEX 模型"""
     res = {
         "Futures_Basis": 0, "Basis_Status": "Normal", 
         "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, "Zero_Gamma": 0,
         "Vanna_Charm_Proxy": "Neutral"
     }
     try:
-        # 1. 期货基差 (Basis)
-        # NQ=F (Nasdaq 100 Futures) vs ^NDX (Nasdaq 100 Spot)
-        # 注意: yfinance 的 ^NDX 有时有延迟，这里仅作趋势参考
         market_data = yf.download(["NQ=F", "^NDX", "QQQ"], period="2d", progress=False)['Close']
         if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.droplevel(0)
         
@@ -122,53 +137,41 @@ def get_derivatives_structure():
         basis = fut - spot
         res['Futures_Basis'] = basis
         
-        if basis < -10: res['Basis_Status'] = "🔴 Backwardation (Extreme Fear/Tight)"
-        elif basis > 50: res['Basis_Status'] = "🟢 Contango (Bullish/Normal)"
-        else: res['Basis_Status'] = "⚪ Flat (Neutral)"
+        if basis < -10: res['Basis_Status'] = "🔴 Backwardation (Fear)"
+        elif basis > 50: res['Basis_Status'] = "🟢 Contango (Normal)"
+        else: res['Basis_Status'] = "⚪ Flat"
         
-        # 2. GEX (Gamma Exposure) Lite Model
-        # 获取 QQQ 期权链
         qqq = yf.Ticker("QQQ")
-        exp = qqq.options[0] # 最近到期日
+        exp = qqq.options[0]
         chain = qqq.option_chain(exp)
         calls = chain.calls
         puts = chain.puts
         
-        # 寻找 Call Wall (最大 OI Call) 和 Put Wall (最大 OI Put)
         max_call_oi_idx = calls['openInterest'].idxmax()
         max_put_oi_idx = puts['openInterest'].idxmax()
         
         res['Call_Wall'] = calls.iloc[max_call_oi_idx]['strike']
         res['Put_Wall'] = puts.iloc[max_put_oi_idx]['strike']
         
-        # 估算 Net GEX Sentiment
-        # 如果价格 > Call Wall，Dealer 必须做空期货对冲 -> 抑制波动 (Positive Gamma)
-        # 如果价格 < Put Wall，Dealer 必须做空期货对冲下跌 -> 放大波动 (Negative Gamma)
         if qqq_price > res['Call_Wall']:
-            res['GEX_Net'] = "🟢 Positive Gamma (Vol Suppressed)"
+            res['GEX_Net'] = "🟢 Positive (Vol Suppressed)"
         elif qqq_price < res['Put_Wall']:
-            res['GEX_Net'] = "🔴 Negative Gamma (Vol Expansion)"
+            res['GEX_Net'] = "🔴 Negative (Vol Expansion)"
         else:
-            res['GEX_Net'] = "⚪ Neutral Gamma Zone"
+            res['GEX_Net'] = "🟢 Positive (Zone)"
             
-        # 3. Vanna/Charm Proxy (基于 VIX 期限结构和 PCR)
-        # 如果 VIX 下跌 且 PCR 极低 -> Dealer 解除对冲 -> 助涨 (Vanna Tailwind)
-        # 如果 VIX 暴涨 -> Vanna Headwind
-        res['Zero_Gamma'] = (res['Call_Wall'] + res['Put_Wall']) / 2 # 粗略估计
-        
         if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
             res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
         else:
             res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
 
-    except Exception as e:
-        print(f"Derivatives Error: {e}")
-        
+    except Exception as e: pass
     return res
 
-@st.cache_data(ttl=600)
+# 期权数据：改为 120秒 缓存 (捕捉实时成交量)
+@st.cache_data(ttl=120)
 def get_qqq_options_data():
-    """PCR & Unusual Radar (保持不变)"""
+    """PCR & Unusual Radar"""
     qqq = yf.Ticker("QQQ")
     res = {"PCR": 0.0, "Unusual": []}
     try:
@@ -191,6 +194,7 @@ def get_qqq_options_data():
     except: pass
     return res
 
+# 日历：保持 1小时
 @st.cache_data(ttl=3600)
 def get_macro_calendar():
     events = [
@@ -208,7 +212,8 @@ def get_macro_calendar():
         if 0 <= days <= 45: upcoming.append({**e, "Days": days})
     return sorted(upcoming, key=lambda x: x['Days'])
 
-@st.cache_data(ttl=600)
+# 新闻：设置为 300秒 (5分钟) 缓存，防止 RSS 源封禁 IP
+@st.cache_data(ttl=300)
 def get_macro_news():
     feeds = [
         ("CNBC Economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
@@ -227,9 +232,6 @@ def get_macro_news():
 # --- 2. 核心算法: 多空评分模型 ---
 
 def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_score_val):
-    """
-    加入衍生品 (Basis, GEX) 的评分逻辑
-    """
     score = 0
     details = []
     
@@ -260,17 +262,15 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     if vol['Crypto_Val'] < 20: fear_score += 0.5
     score += fear_score
     
-    # 4. 交易与微观结构 (20%) - [更新] 加入 GEX/Basis
+    # 4. 交易与微观结构 (20%)
     trade_score = 0
-    # PCR
     if opt['PCR'] > 1.1: trade_score -= 0.5; details.append("📉 PCR 偏空")
     elif opt['PCR'] < 0.7: trade_score += 0.5
     
-    # GEX / Basis
     if deriv['Basis_Status'].startswith("🔴"): 
-        trade_score -= 1.0; details.append("🔴 期货贴水 (资金看空)")
+        trade_score -= 1.0; details.append("🔴 期货贴水")
     if deriv['GEX_Net'].startswith("🔴"):
-        trade_score -= 0.5; details.append("🔴 负 Gamma (波动放大)")
+        trade_score -= 0.5; details.append("🔴 负 Gamma")
     elif deriv['GEX_Net'].startswith("🟢"):
         trade_score += 0.5
         
@@ -285,7 +285,7 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
 
 # --- 3. 界面渲染 (UI) ---
 
-with st.spinner("正在同步全球市场微观结构数据..."):
+with st.spinner("正在同步全球市场实时数据 (2分钟刷新)..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
     fed_liq = get_fed_liquidity()
@@ -293,7 +293,7 @@ with st.spinner("正在同步全球市场微观结构数据..."):
     rates = get_rates_and_fx()
     vol = get_volatility_indices()
     opt = get_qqq_options_data()
-    deriv = get_derivatives_structure() # 新增
+    deriv = get_derivatives_structure()
     cal = get_macro_calendar()
     raw_news = get_macro_news()
 
@@ -317,9 +317,9 @@ with st.spinner("正在同步全球市场微观结构数据..."):
     final_score, reasons = calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, avg_news_score)
 
 # --- HEADER ---
-st.title("🦅 QQQ 宏观战情室 (Macro War Room)")
+st.title("🦅 QQQ 宏观战情室 Pro (Live)")
 current_time = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M EST')
-st.caption(f"数据更新时间: {current_time}")
+st.caption(f"上次更新: {current_time} | 自动刷新: 开启 (120s)")
 
 col_score, col_text = st.columns([1, 3])
 with col_score:
@@ -359,8 +359,7 @@ r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# --- 模块 3: 交易与微观结构 (Trading & Market Structure) ---
-# [更新] 加入了衍生品结构板块
+# --- 模块 3: 交易与微观结构 ---
 st.subheader("3. 交易与微观结构 (Options & GEX)")
 t1, t2, t3, t4 = st.columns(4)
 
@@ -369,7 +368,6 @@ t2.metric("VIX 股市恐慌", f"{vol['VIX']:.2f}")
 t3.metric("币圈恐慌指数", f"{vol['Crypto_Val']}", f"{vol['Crypto_Text']}")
 t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'])
 
-# Gamma Exposure Display
 g1, g2, g3 = st.columns(3)
 g1.metric("Net Gamma (GEX)", deriv['GEX_Net'], "正Gamma抑制波动，负Gamma放大波动")
 g2.metric("关键支撑 (Put Wall)", f"${deriv['Put_Wall']}", "最大 Put 持仓位")
