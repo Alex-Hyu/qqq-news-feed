@@ -492,3 +492,95 @@ with c2:
     - 🕊️ **鸽派**: Goolsbee
     - ⚖️ **中性**: Powell
     """)
+    # ... (上面所有原有代码保持不变) ...
+
+# --- [新增] 模块 6: 日内战术面板 (Intraday Tactical) ---
+st.subheader("6. 日内交易战术面板 (0DTE & Micro Structure)")
+
+@st.cache_data(ttl=60) # 1分钟刷新，日内要求高时效
+def get_intraday_tactics():
+    res = {
+        "VWAP": 0, "Price": 0, "Trend": "Neutral",
+        "Exp_Move": 0, "Upper_Band": 0, "Lower_Band": 0,
+        "0DTE_Call_Vol": 0, "0DTE_Put_Vol": 0, "0DTE_Sentiment": "Neutral"
+    }
+    try:
+        # 1. 获取 QQQ 日内 1分钟 数据计算 VWAP
+        # 注意: yfinance 免费版日内数据可能延迟，实盘请以此为参考趋势
+        df = yf.download("QQQ", period="1d", interval="5m", progress=False)
+        if not df.empty:
+            # 计算 VWAP = Cumulative(Price * Vol) / Cumulative(Vol)
+            df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
+            df['PV'] = df['TP'] * df['Volume']
+            vwap = df['PV'].sum() / df['Volume'].sum()
+            
+            current_price = df['Close'].iloc[-1]
+            res['VWAP'] = vwap
+            res['Price'] = current_price
+            
+            if current_price > vwap * 1.001: res['Trend'] = "🟢 多头控盘 (Above VWAP)"
+            elif current_price < vwap * 0.999: res['Trend'] = "🔴 空头控盘 (Below VWAP)"
+            else: res['Trend'] = "⚪ 震荡 (At VWAP)"
+            
+        # 2. 计算今日预期波动 (Expected Move)
+        # 简化公式: 0DTE ATM Straddle Price (Call + Put)
+        # 这里用 VIX 倒推: Exp Move = Price * (VIX/16) * sqrt(1/252)
+        # VIX/16 近似日波动率
+        vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
+        daily_vol = (vix / 100) / np.sqrt(252)
+        exp_move = res['Price'] * daily_vol
+        
+        res['Exp_Move'] = exp_move
+        res['Upper_Band'] = res['Price'] + exp_move
+        res['Lower_Band'] = res['Price'] - exp_move
+        
+        # 3. 0DTE 情绪 (近似)
+        qqq = yf.Ticker("QQQ")
+        # 找最近的过期日
+        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        dates = qqq.options
+        target_date = dates[0] # 最近的一期，可能是今天或明天
+        
+        chain = qqq.option_chain(target_date)
+        c_vol = chain.calls['volume'].sum()
+        p_vol = chain.puts['volume'].sum()
+        
+        res['0DTE_Call_Vol'] = c_vol
+        res['0DTE_Put_Vol'] = p_vol
+        
+        if c_vol > p_vol: res['0DTE_Sentiment'] = "🟢 Call 主导 (追涨)"
+        else: res['0DTE_Sentiment'] = "🔴 Put 主导 (杀跌/避险)"
+        
+        res['Expiry_Date'] = target_date
+
+    except Exception as e: pass
+    return res
+
+# UI 渲染
+with st.spinner("正在计算日内 VWAP 与 0DTE 数据..."):
+    tactics = get_intraday_tactics()
+
+c_day1, c_day2, c_day3, c_day4 = st.columns(4)
+
+# 1. VWAP 趋势
+c_day1.metric("日内趋势 (VWAP)", f"${tactics['VWAP']:.2f}", tactics['Trend'], delta_color="off")
+
+# 2. 预期波动
+c_day2.metric("今日预期波动", f"±${tactics['Exp_Move']:.2f}", f"VIX推算")
+
+# 3. 0DTE 情绪
+c_day3.metric(f"短期期权 ({tactics.get('Expiry_Date','')})", tactics['0DTE_Sentiment'], f"C/P Vol: {int(tactics['0DTE_Call_Vol']/1000)}k / {int(tactics['0DTE_Put_Vol']/1000)}k")
+
+# 4. 交易区间
+c_day4.metric("今日安全边界", f"${tactics['Lower_Band']:.2f} - ${tactics['Upper_Band']:.2f}", "超跌/超买区域")
+
+# 交易建议展示
+with st.expander("🏹 日内期权狙击指南 (Intraday Cheat Sheet)", expanded=True):
+    st.markdown(f"""
+    *   **当前价格**: `${tactics['Price']:.2f}` vs **VWAP**: `${tactics['VWAP']:.2f}`
+    *   **策略**:
+        *   若价格 > VWAP 且 Gamma Positive (🟢): **逢低做多 (Buy Calls on Dips)**.
+        *   若价格 < VWAP 且 Gamma Negative (🔴): **逢高做空 (Buy Puts on Rallies)**.
+        *   若价格触及 `${tactics['Upper_Band']:.2f}` (上轨): 考虑 **反向做空/止盈 (Fade the move)**.
+        *   若价格触及 `${tactics['Lower_Band']:.2f}` (下轨): 考虑 **反向做多/止盈 (Buy the dip)**.
+    """)
