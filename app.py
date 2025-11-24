@@ -4,10 +4,11 @@ import pandas as pd
 import numpy as np
 import requests
 import datetime
+from datetime import timedelta
 import pytz
 import feedparser
+from io import StringIO
 from transformers import pipeline
-# 引入自动刷新库
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. 全局配置 ---
@@ -19,20 +20,28 @@ st.markdown("""
     .news-card {padding: 10px; margin-bottom: 5px; border-radius: 5px; border-left: 5px solid #ccc;}
     .news-bull {background-color: #e6fffa; border-left-color: #00c04b;}
     .news-bear {background-color: #fff5f5; border-left-color: #ff4b4b;}
-    /* 日历表格样式 */
-    .cal-table {font-size: 0.9em;}
-    .cal-high {color: #d9534f; font-weight: bold;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- [侧边栏] 自动刷新控制 ---
+# --- [侧边栏] 配置与刷新 ---
 with st.sidebar:
-    st.header("⚙️ 系统状态")
-    # 30分钟 = 30 * 60 * 1000 毫秒
-    count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
-    st.caption(f"🟢 自动刷新已开启 (30分钟/次)")
+    st.header("⚙️ 设置")
     
-    if st.button("🔄 立即手动刷新"):
+    # [修改] 这里已经填入了你的 API Key，默认隐藏显示
+    av_api_key = st.text_input(
+        "AlphaVantage API Key", 
+        value="UMWB63OXOOCIZHXR", 
+        type="password", 
+        help="用于获取真实宏观日历数据"
+    )
+    
+    st.divider()
+    
+    st.subheader("系统状态")
+    # 30分钟自动刷新
+    count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
+    st.caption(f"🟢 自动刷新: 开启 (30分钟)")
+    if st.button("🔄 立即刷新"):
         st.rerun()
 
 # --- 1. 核心模型与数据获取 ---
@@ -41,7 +50,7 @@ with st.sidebar:
 def load_ai_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-# 宏观数据：每天更新一次
+# 宏观数据
 @st.cache_data(ttl=3600)
 def get_ny_fed_data():
     try:
@@ -54,7 +63,7 @@ def get_ny_fed_data():
         return rates
     except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
-# RRP/TGA 每天更新
+# RRP/TGA
 @st.cache_data(ttl=3600)
 def get_fed_liquidity():
     res = {"RRP": 0, "RRP_Chg": 0, "TGA": 0, "TGA_Chg": 0}
@@ -62,14 +71,13 @@ def get_fed_liquidity():
         rrp_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD")
         res['RRP'] = rrp_df.iloc[-1]['RRPONTSYD']
         res['RRP_Chg'] = res['RRP'] - rrp_df.iloc[-2]['RRPONTSYD']
-        
         tga_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN")
         res['TGA'] = tga_df.iloc[-1]['WTREGEN']
         res['TGA_Chg'] = res['TGA'] - tga_df.iloc[-2]['WTREGEN']
     except: pass
     return res
 
-# 市场数据：30分钟缓存
+# 市场数据
 @st.cache_data(ttl=1800)
 def get_credit_spreads():
     try:
@@ -88,7 +96,6 @@ def get_rates_and_fx():
     try:
         df = yf.download(tickers, period="5d", progress=False)['Close']
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(0)
-        
         res['Yield_2Y'] = df.get('^IRX', pd.Series([5.2])).iloc[-1]
         res['Yield_10Y'] = df.get('^TNX', pd.Series([4.2])).iloc[-1]
         res['Yield_30Y'] = df.get('^TYX', pd.Series([4.4])).iloc[-1]
@@ -115,9 +122,9 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
+# GEX/Flip Line
 @st.cache_data(ttl=1800)
 def get_derivatives_structure():
-    """获取 期货基差 + GEX 模型 + 自算 Flip Line"""
     res = {
         "Futures_Basis": 0, "Basis_Status": "Normal", 
         "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, 
@@ -125,7 +132,6 @@ def get_derivatives_structure():
         "Vanna_Charm_Proxy": "Neutral"
     }
     try:
-        # 1. 价格与基差
         market_data = yf.download(["NQ=F", "^NDX", "QQQ"], period="2d", progress=False)['Close']
         if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.droplevel(0)
         
@@ -140,9 +146,8 @@ def get_derivatives_structure():
         elif basis > 50: res['Basis_Status'] = "🟢 Contango"
         else: res['Basis_Status'] = "⚪ Flat"
         
-        # 2. GEX 计算
         qqq = yf.Ticker("QQQ")
-        exp = qqq.options[0] # 最近到期日
+        exp = qqq.options[0]
         chain = qqq.option_chain(exp)
         calls = chain.calls
         puts = chain.puts
@@ -150,10 +155,8 @@ def get_derivatives_structure():
         res['Call_Wall'] = calls.loc[calls['openInterest'].idxmax()]['strike']
         res['Put_Wall'] = puts.loc[puts['openInterest'].idxmax()]['strike']
         
-        # 估算 Flip Line
         calls['G_Contribution'] = calls['openInterest']
         puts['G_Contribution'] = puts['openInterest'] * -1
-        
         merged = pd.concat([calls[['strike', 'G_Contribution']], puts[['strike', 'G_Contribution']]])
         gamma_profile = merged.groupby('strike').sum().sort_index()
         
@@ -165,17 +168,14 @@ def get_derivatives_structure():
         
         if flip_strike == 0: res['Flip_Line'] = res['Put_Wall']
         else: res['Flip_Line'] = (res['Put_Wall'] + flip_strike) / 2
-            
+        
         if abs(res['Flip_Line'] - qqq_price) > 50: res['Flip_Line'] = res['Put_Wall']
-
-        if qqq_price < res['Flip_Line']: res['GEX_Net'] = "🔴 Negative Gamma (高波动)"
-        else: res['GEX_Net'] = "🟢 Positive Gamma (低波动)"
+        if qqq_price < res['Flip_Line']: res['GEX_Net'] = "🔴 Negative Gamma"
+        else: res['GEX_Net'] = "🟢 Positive Gamma"
             
-        # Vanna
         if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
             res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
         else: res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
-
     except Exception as e: pass
     return res
 
@@ -203,66 +203,78 @@ def get_qqq_options_data():
     except: pass
     return res
 
-# --- [重点修改] 宏观日历：抓取 Nasdaq 真实 JSON ---
+# --- 双重保障的宏观日历 ---
 @st.cache_data(ttl=3600)
-def get_real_macro_calendar():
+def get_macro_calendar(api_key=""):
     """
-    抓取 Nasdaq 官方 API 获取本周真实经济数据
-    并根据重要性筛选
+    优先使用 Alpha Vantage API (Key已内置)
+    失败则使用算法估算
     """
-    url = "https://api.nasdaq.com/api/calendar/economic"
-    # 必须伪装 User-Agent，否则会被拒绝
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-    
-    # 关键词过滤，只看重要的
-    important_keywords = [
-        "CPI", "GDP", "PCE", "Nonfarm", "Payroll", "Fed", "FOMC", "Rate", 
-        "Unemployment", "ISM", "Consumer Confidence", "Inventories", "Job"
-    ]
-    
+    # 方案 A: API 模式
+    if api_key:
+        try:
+            url = f"https://www.alphavantage.co/query?function=ECONOMIC_CALENDAR&apikey={api_key}"
+            r = requests.get(url, timeout=5)
+            df = pd.read_csv(StringIO(r.text))
+            
+            # 过滤美元数据
+            df = df[df['currency'] == 'USD']
+            
+            # 智能筛选关键词
+            keywords = ["GDP", "Unemployment", "CPI", "Interest Rate", "Payroll", "FOMC", "PCE", "Inventories"]
+            df['is_important'] = df['event'].apply(lambda x: any(k in x for k in keywords))
+            df = df[df['is_important']]
+            
+            # 只要未来的
+            today = datetime.date.today().strftime("%Y-%m-%d")
+            df = df[df['date'] >= today].sort_values('date').head(10)
+            
+            display_df = df[['date', 'time', 'event', 'estimate', 'previous']].copy()
+            display_df.columns = ['Date', 'Time', 'Event', 'Est', 'Prev']
+            
+            # 如果没数据 (比如周末或假期)，可能返回空，这时触发方案 B
+            if not display_df.empty:
+                return display_df, "API Data (AlphaVantage)"
+            
+        except Exception as e:
+            pass # 失败则静默进入方案 B
+
+    # 方案 B: 算法估算兜底
+    today = datetime.date.today()
     events = []
-    try:
-        # 获取当月数据 (API 默认返回当前日期所在的视图)
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        r = requests.get(f"{url}?date={today}", headers=headers, timeout=5)
-        data = r.json()
-        
-        rows = data.get('data', {}).get('calendar', {}).get('rows', [])
-        
-        if rows:
-            for row in rows:
-                # 只看美国数据
-                if row.get('country') != "United States":
-                    continue
-                
-                name = row.get('event', '')
-                date_str = row.get('date', '') # MM/DD/YYYY
-                time_str = row.get('time', 'N/A')
-                
-                # 检查是否包含重要关键词
-                is_important = any(k in name for k in important_keywords)
-                
-                if is_important:
-                    events.append({
-                        "Date": date_str,
-                        "Time": time_str,
-                        "Event": name,
-                        "Actual": row.get('actual', ''),
-                        "Consensus": row.get('consensus', ''),
-                        "Prior": row.get('prior', '')
-                    })
-    except Exception as e:
-        # 如果 API 失败，返回一个提示
-        return pd.DataFrame([{"Date": "Error", "Event": "无法连接日历数据源", "Time": ""}])
-        
+    
+    # 估算 CPI (每月12号左右)
+    next_month = today.replace(day=28) + datetime.timedelta(days=4)
+    next_cpi = today.replace(day=12) 
+    if today.day > 12: next_cpi = (next_month - datetime.timedelta(days=1)).replace(day=12)
+    events.append({"Date": next_cpi, "Event": "CPI 通胀数据 (估算)", "Type": "Inflation"})
+    
+    # 估算 非农 (每月5号左右)
+    next_nfp = today.replace(day=5)
+    if today.day > 5: next_nfp = (next_month - datetime.timedelta(days=1)).replace(day=5)
+    events.append({"Date": next_nfp, "Event": "Nonfarm Payrolls (估算)", "Type": "Jobs"})
+    
+    # 估算 FOMC
+    known_fomc = ["2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-12-10"]
+    for d_str in known_fomc:
+        d = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
+        if d >= today:
+            events.append({"Date": d, "Event": "FOMC 利率决议 (预设)", "Type": "Fed"})
+            break 
+            
+    events.append({"Date": datetime.date(today.year, 6, 15), "Event": "Q2 缴税日 (流动性抽水)", "Type": "Liquidity"})
+    
+    events = sorted(events, key=lambda x: x['Date'])
     df = pd.DataFrame(events)
-    # 按日期排序 (简单字符串排序在同年份下有效)
-    if not df.empty:
-        # 限制显示数量
-        return df.head(10)
-    return pd.DataFrame()
+    df = df[df['Date'] >= today].head(5)
+    
+    display_df = df.copy()
+    display_df['Time'] = "N/A"
+    display_df['Est'] = "--"
+    display_df['Prev'] = "--"
+    display_df = display_df[['Date', 'Time', 'Event', 'Est', 'Prev']]
+    
+    return display_df, "备用数据 (Estimated)"
 
 @st.cache_data(ttl=1800)
 def get_macro_news():
@@ -338,8 +350,8 @@ with st.spinner("正在同步全球市场数据 (30分钟刷新)..."):
     vol = get_volatility_indices()
     opt = get_qqq_options_data()
     deriv = get_derivatives_structure()
-    # [修改] 调用新的日历函数
-    cal_df = get_real_macro_calendar()
+    # 传入 API Key
+    cal_df, cal_source = get_macro_calendar(av_api_key)
     raw_news = get_macro_news()
 
     processed_news = []
@@ -404,7 +416,7 @@ r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# 3. 交易与微观结构 (含 PCR Cheatsheet)
+# 3. 交易与微观结构
 st.subheader("3. 交易与微观结构 (Gamma Flip & GEX)")
 t1, t2, t3, t4 = st.columns(4)
 
@@ -423,7 +435,6 @@ with st.expander("📚 交易员参考手册：如何解读 PCR (OI)？", expand
     #### 1. 数值 > 1.2 (高位 - 极度悲观)
     *   **直观感觉**: 大家都看空。做市商手里全是 Short Put (Long Delta)。
     *   **🛡️ 操作**: 只要 QQQ 没崩，意味着底部支撑强。反弹时做市商必须买回对冲。**反向做多信号。**
-
     #### 2. 数值 < 0.7 (低位 - 极度贪婪)
     *   **直观感觉**: 大家都看多。做市商手里全是 Short Call (Short Delta)。
     *   **⚠️ 操作**: 上涨吃力 (Call Wall 阻力)。**反向做空/止盈信号。**
@@ -460,26 +471,19 @@ with col_news_stat:
 st.divider()
 
 # 5. 日历
-st.subheader("5. 宏观日历 (Real-time Nasdaq Data)")
+st.subheader(f"5. 宏观日历 ({cal_source})")
 c1, c2 = st.columns([3, 1])
 with c1:
     if not cal_df.empty:
-        # 使用 Streamlit dataframe 进行美化展示
         st.dataframe(
             cal_df,
             column_config={
-                "Date": "日期",
-                "Time": "时间",
-                "Event": "事件",
-                "Actual": "公布值",
-                "Consensus": "预期值",
-                "Prior": "前值"
+                "Date": "日期", "Time": "时间", "Event": "事件",
+                "Est": "预期", "Prev": "前值"
             },
-            hide_index=True,
-            use_container_width=True
+            hide_index=True, use_container_width=True
         )
-    else:
-        st.write("本周暂无符合条件的重要经济数据发布。")
+    else: st.write("近期无重要数据。")
 
 with c2:
     st.markdown("""
