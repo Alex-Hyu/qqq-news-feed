@@ -7,6 +7,7 @@ import datetime
 import pytz
 import feedparser
 from transformers import pipeline
+# 引入自动刷新库
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. 全局配置 ---
@@ -18,13 +19,19 @@ st.markdown("""
     .news-card {padding: 10px; margin-bottom: 5px; border-radius: 5px; border-left: 5px solid #ccc;}
     .news-bull {background-color: #e6fffa; border-left-color: #00c04b;}
     .news-bear {background-color: #fff5f5; border-left-color: #ff4b4b;}
+    /* 日历表格样式 */
+    .cal-table {font-size: 0.9em;}
+    .cal-high {color: #d9534f; font-weight: bold;}
     </style>
     """, unsafe_allow_html=True)
 
+# --- [侧边栏] 自动刷新控制 ---
 with st.sidebar:
     st.header("⚙️ 系统状态")
+    # 30分钟 = 30 * 60 * 1000 毫秒
     count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
     st.caption(f"🟢 自动刷新已开启 (30分钟/次)")
+    
     if st.button("🔄 立即手动刷新"):
         st.rerun()
 
@@ -34,6 +41,7 @@ with st.sidebar:
 def load_ai_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
+# 宏观数据：每天更新一次
 @st.cache_data(ttl=3600)
 def get_ny_fed_data():
     try:
@@ -46,6 +54,7 @@ def get_ny_fed_data():
         return rates
     except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
+# RRP/TGA 每天更新
 @st.cache_data(ttl=3600)
 def get_fed_liquidity():
     res = {"RRP": 0, "RRP_Chg": 0, "TGA": 0, "TGA_Chg": 0}
@@ -53,12 +62,14 @@ def get_fed_liquidity():
         rrp_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD")
         res['RRP'] = rrp_df.iloc[-1]['RRPONTSYD']
         res['RRP_Chg'] = res['RRP'] - rrp_df.iloc[-2]['RRPONTSYD']
+        
         tga_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN")
         res['TGA'] = tga_df.iloc[-1]['WTREGEN']
         res['TGA_Chg'] = res['TGA'] - tga_df.iloc[-2]['WTREGEN']
     except: pass
     return res
 
+# 市场数据：30分钟缓存
 @st.cache_data(ttl=1800)
 def get_credit_spreads():
     try:
@@ -77,6 +88,7 @@ def get_rates_and_fx():
     try:
         df = yf.download(tickers, period="5d", progress=False)['Close']
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(0)
+        
         res['Yield_2Y'] = df.get('^IRX', pd.Series([5.2])).iloc[-1]
         res['Yield_10Y'] = df.get('^TNX', pd.Series([4.2])).iloc[-1]
         res['Yield_30Y'] = df.get('^TYX', pd.Series([4.4])).iloc[-1]
@@ -103,7 +115,6 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-# --- [重点] 自算 Gamma Flip 核心算法 ---
 @st.cache_data(ttl=1800)
 def get_derivatives_structure():
     """获取 期货基差 + GEX 模型 + 自算 Flip Line"""
@@ -136,55 +147,34 @@ def get_derivatives_structure():
         calls = chain.calls
         puts = chain.puts
         
-        # 2.1 基础墙
         res['Call_Wall'] = calls.loc[calls['openInterest'].idxmax()]['strike']
         res['Put_Wall'] = puts.loc[puts['openInterest'].idxmax()]['strike']
         
-        # 2.2 [新增] 估算 Zero Gamma Flip Line
-        # 算法: 寻找 Call OI 和 Put OI 累计影响的平衡点
-        # 简化模型: Flip Line 往往位于 Put Wall 附近，或 Max Pain 附近
-        # 我们使用 "OI 加权中值" 作为近似
-        calls['G_Contribution'] = calls['openInterest'] # 正 Gamma 近似
-        puts['G_Contribution'] = puts['openInterest'] * -1 # 负 Gamma 近似
+        # 估算 Flip Line
+        calls['G_Contribution'] = calls['openInterest']
+        puts['G_Contribution'] = puts['openInterest'] * -1
         
-        # 合并所有 Strike 的 Gamma 贡献
         merged = pd.concat([calls[['strike', 'G_Contribution']], puts[['strike', 'G_Contribution']]])
         gamma_profile = merged.groupby('strike').sum().sort_index()
         
-        # 找到由正转负的那个 Strike (Zero Crossing)
-        # 通常是从高价(Call主导)跌到低价(Put主导)的过程
         flip_strike = 0
-        
-        # 简单粗暴法: 找到 Put OI 巨大的那个区域的上方一点点
-        # 这里的近似逻辑: 当 Put OI 开始显著大于 Call OI 时，Gamma 转负
         for index, row in gamma_profile.iterrows():
-            if row['G_Contribution'] < 0: # 净 Put 主导
+            if row['G_Contribution'] < 0:
                 flip_strike = index
-                # 往上找第一个 Call 主导的作为边界
                 break
         
-        # 修正: 如果找不到，就用 Put Wall 作为最强 Flip Line
-        if flip_strike == 0:
-            res['Flip_Line'] = res['Put_Wall']
-        else:
-            # 取 Put Wall 和 理论翻转点的均值，平滑数据
-            res['Flip_Line'] = (res['Put_Wall'] + flip_strike) / 2
+        if flip_strike == 0: res['Flip_Line'] = res['Put_Wall']
+        else: res['Flip_Line'] = (res['Put_Wall'] + flip_strike) / 2
             
-        # 强制修正: Flip Line 通常不会离现价太远，如果数据异常，回退到 Put Wall
-        if abs(res['Flip_Line'] - qqq_price) > 50:
-             res['Flip_Line'] = res['Put_Wall']
+        if abs(res['Flip_Line'] - qqq_price) > 50: res['Flip_Line'] = res['Put_Wall']
 
-        # 3. 判断 GEX 状态
-        if qqq_price < res['Flip_Line']:
-            res['GEX_Net'] = "🔴 Negative Gamma (高波动)"
-        else:
-            res['GEX_Net'] = "🟢 Positive Gamma (低波动)"
+        if qqq_price < res['Flip_Line']: res['GEX_Net'] = "🔴 Negative Gamma (高波动)"
+        else: res['GEX_Net'] = "🟢 Positive Gamma (低波动)"
             
-        # 4. Vanna
+        # Vanna
         if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
             res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
-        else:
-            res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
+        else: res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
 
     except Exception as e: pass
     return res
@@ -213,22 +203,66 @@ def get_qqq_options_data():
     except: pass
     return res
 
+# --- [重点修改] 宏观日历：抓取 Nasdaq 真实 JSON ---
 @st.cache_data(ttl=3600)
-def get_macro_calendar():
-    events = [
-        {"Date": "2024-06-12", "Event": "CPI 数据发布", "Type": "Inflation"},
-        {"Date": "2024-06-12", "Event": "FOMC 利率决议", "Type": "Fed"},
-        {"Date": "2024-06-14", "Event": "BOJ 日本央行会议", "Type": "BOJ"},
-        {"Date": "2024-07-05", "Event": "NFP 非农就业", "Type": "Jobs"},
-        {"Date": "2024-06-15", "Event": "企业缴税日 (TGA抽水)", "Type": "Liquidity"},
+def get_real_macro_calendar():
+    """
+    抓取 Nasdaq 官方 API 获取本周真实经济数据
+    并根据重要性筛选
+    """
+    url = "https://api.nasdaq.com/api/calendar/economic"
+    # 必须伪装 User-Agent，否则会被拒绝
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    # 关键词过滤，只看重要的
+    important_keywords = [
+        "CPI", "GDP", "PCE", "Nonfarm", "Payroll", "Fed", "FOMC", "Rate", 
+        "Unemployment", "ISM", "Consumer Confidence", "Inventories", "Job"
     ]
-    today = datetime.date.today()
-    upcoming = []
-    for e in events:
-        d = datetime.datetime.strptime(e['Date'], "%Y-%m-%d").date()
-        days = (d - today).days
-        if 0 <= days <= 45: upcoming.append({**e, "Days": days})
-    return sorted(upcoming, key=lambda x: x['Days'])
+    
+    events = []
+    try:
+        # 获取当月数据 (API 默认返回当前日期所在的视图)
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        r = requests.get(f"{url}?date={today}", headers=headers, timeout=5)
+        data = r.json()
+        
+        rows = data.get('data', {}).get('calendar', {}).get('rows', [])
+        
+        if rows:
+            for row in rows:
+                # 只看美国数据
+                if row.get('country') != "United States":
+                    continue
+                
+                name = row.get('event', '')
+                date_str = row.get('date', '') # MM/DD/YYYY
+                time_str = row.get('time', 'N/A')
+                
+                # 检查是否包含重要关键词
+                is_important = any(k in name for k in important_keywords)
+                
+                if is_important:
+                    events.append({
+                        "Date": date_str,
+                        "Time": time_str,
+                        "Event": name,
+                        "Actual": row.get('actual', ''),
+                        "Consensus": row.get('consensus', ''),
+                        "Prior": row.get('prior', '')
+                    })
+    except Exception as e:
+        # 如果 API 失败，返回一个提示
+        return pd.DataFrame([{"Date": "Error", "Event": "无法连接日历数据源", "Time": ""}])
+        
+    df = pd.DataFrame(events)
+    # 按日期排序 (简单字符串排序在同年份下有效)
+    if not df.empty:
+        # 限制显示数量
+        return df.head(10)
+    return pd.DataFrame()
 
 @st.cache_data(ttl=1800)
 def get_macro_news():
@@ -282,13 +316,8 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     if opt['PCR'] > 1.1: trade_score -= 0.5; details.append("📉 PCR 偏空")
     elif opt['PCR'] < 0.7: trade_score += 0.5
     if deriv['Basis_Status'].startswith("🔴"): trade_score -= 1.0; details.append("🔴 期货贴水")
-    
-    # Flip Line 判定
-    if deriv['GEX_Net'].startswith("🔴"):
-        trade_score -= 0.5; details.append("🔴 跌破 Gamma Flip (负Gamma)")
-    elif deriv['GEX_Net'].startswith("🟢"):
-        trade_score += 0.5
-        
+    if deriv['GEX_Net'].startswith("🔴"): trade_score -= 0.5; details.append("🔴 跌破 Gamma Flip")
+    elif deriv['GEX_Net'].startswith("🟢"): trade_score += 0.5
     score += max(-2.0, min(2.0, trade_score))
     
     # 5. 新闻 (15%)
@@ -300,7 +329,7 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
 
 # --- 3. UI ---
 
-with st.spinner("正在计算 Gamma Flip Line 及同步数据 (30分钟刷新)..."):
+with st.spinner("正在同步全球市场数据 (30分钟刷新)..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
     fed_liq = get_fed_liquidity()
@@ -309,7 +338,8 @@ with st.spinner("正在计算 Gamma Flip Line 及同步数据 (30分钟刷新)..
     vol = get_volatility_indices()
     opt = get_qqq_options_data()
     deriv = get_derivatives_structure()
-    cal = get_macro_calendar()
+    # [修改] 调用新的日历函数
+    cal_df = get_real_macro_calendar()
     raw_news = get_macro_news()
 
     processed_news = []
@@ -374,7 +404,7 @@ r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# 3. 交易与微观结构 (含 Flip Line)
+# 3. 交易与微观结构 (含 PCR Cheatsheet)
 st.subheader("3. 交易与微观结构 (Gamma Flip & GEX)")
 t1, t2, t3, t4 = st.columns(4)
 
@@ -384,10 +414,20 @@ t3.metric("币圈恐慌指数", f"{vol['Crypto_Val']}", f"{vol['Crypto_Text']}")
 t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'])
 
 g1, g2, g3 = st.columns(3)
-# 这里显示自算的 Flip Line
 g1.metric("Gamma Flip Line (自算)", f"${deriv['Flip_Line']:.2f}", deriv['GEX_Net'], delta_color="off")
-g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "最大空头Gamma聚集")
-g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "最大多头Gamma聚集")
+g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "最大空头Gamma")
+g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "最大多头Gamma")
+
+with st.expander("📚 交易员参考手册：如何解读 PCR (OI)？", expanded=False):
+    st.markdown("""
+    #### 1. 数值 > 1.2 (高位 - 极度悲观)
+    *   **直观感觉**: 大家都看空。做市商手里全是 Short Put (Long Delta)。
+    *   **🛡️ 操作**: 只要 QQQ 没崩，意味着底部支撑强。反弹时做市商必须买回对冲。**反向做多信号。**
+
+    #### 2. 数值 < 0.7 (低位 - 极度贪婪)
+    *   **直观感觉**: 大家都看多。做市商手里全是 Short Call (Short Delta)。
+    *   **⚠️ 操作**: 上涨吃力 (Call Wall 阻力)。**反向做空/止盈信号。**
+    """)
 
 with st.expander("查看 QQQ 异动雷达与 Vanna/Charm 状态", expanded=True):
     c_ex1, c_ex2 = st.columns([2, 1])
@@ -420,10 +460,31 @@ with col_news_stat:
 st.divider()
 
 # 5. 日历
-st.subheader("5. 宏观日历")
-if cal:
-    cols = st.columns(len(cal) if len(cal)<5 else 5)
-    for idx, e in enumerate(cal[:5]):
-        with cols[idx]:
-            color = "red" if e['Days'] <= 5 else "black"
-            st.markdown(f":{color}[**{e['Event']}**]\n\n{e['Date']} ({e['Days']}天)")
+st.subheader("5. 宏观日历 (Real-time Nasdaq Data)")
+c1, c2 = st.columns([3, 1])
+with c1:
+    if not cal_df.empty:
+        # 使用 Streamlit dataframe 进行美化展示
+        st.dataframe(
+            cal_df,
+            column_config={
+                "Date": "日期",
+                "Time": "时间",
+                "Event": "事件",
+                "Actual": "公布值",
+                "Consensus": "预期值",
+                "Prior": "前值"
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+    else:
+        st.write("本周暂无符合条件的重要经济数据发布。")
+
+with c2:
+    st.markdown("""
+    **Fed 观察**:
+    - 🦅 **鹰派**: Waller
+    - 🕊️ **鸽派**: Goolsbee
+    - ⚖️ **中性**: Powell
+    """)
