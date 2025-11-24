@@ -462,3 +462,110 @@ with c2:
     - 🕊️ **鸽派**: Goolsbee
     - ⚖️ **中性**: Powell
     """)
+    # --- [升级版] 模块 6: 日内战术面板 (High Frequency) ---
+st.subheader("6. 日内交易战术面板 (0DTE & Micro Structure)")
+
+# 注意：为了保证日内时效性，这里的缓存设为 30秒
+# 但前提是你需要手动点击刷新，或者把自动刷新频率调高
+@st.cache_data(ttl=30) 
+def get_intraday_tactics():
+    res = {
+        "VWAP": 0, "Price": 0, "Trend": "Neutral",
+        "Exp_Move": 0, "Upper_Band": 0, "Lower_Band": 0,
+        "0DTE_Call_Vol": 0, "0DTE_Put_Vol": 0, "0DTE_Sentiment": "Neutral",
+        "Last_Update": datetime.datetime.now().strftime("%H:%M:%S")
+    }
+    try:
+        # 1. 改为 1分钟 粒度，获取更精准的 VWAP
+        df = yf.download("QQQ", period="1d", interval="1m", progress=False)
+        
+        if not df.empty:
+            # 计算 VWAP (Volume Weighted Average Price)
+            # 公式: sum(Price * Vol) / sum(Vol)
+            # 使用 HLC/3 作为典型价格
+            df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
+            df['PV'] = df['Typical_Price'] * df['Volume']
+            
+            # 累加计算当天的 VWAP
+            vwap = df['PV'].sum() / df['Volume'].sum()
+            
+            current_price = df['Close'].iloc[-1]
+            res['VWAP'] = vwap
+            res['Price'] = current_price
+            
+            # 判定乖离率 (0.1% 阈值)
+            threshold = 0.001 
+            if current_price > vwap * (1 + threshold): 
+                res['Trend'] = "🟢 多头强势 (Above VWAP)"
+            elif current_price < vwap * (1 - threshold): 
+                res['Trend'] = "🔴 空头压制 (Below VWAP)"
+            else: 
+                res['Trend'] = "⚪ 震荡缠绕 (At VWAP)"
+            
+        # 2. 计算今日预期波动 (Expected Move)
+        # 使用 1分钟 VIX 数据更准
+        vix_df = yf.download("^VIX", period="1d", interval="1m", progress=False)
+        if not vix_df.empty:
+            vix = vix_df['Close'].iloc[-1]
+        else:
+            vix = 15.0 # 兜底
+            
+        # 日波动率 ≈ VIX / 16
+        daily_vol_pct = (vix / 16) / 100
+        exp_move = res['Price'] * daily_vol_pct
+        
+        res['Exp_Move'] = exp_move
+        res['Upper_Band'] = res['Price'] + exp_move
+        res['Lower_Band'] = res['Price'] - exp_move
+        
+        # 3. 0DTE 情绪 (依然受限于 Yahoo 延迟，仅作参考)
+        qqq = yf.Ticker("QQQ")
+        dates = qqq.options
+        target_date = dates[0] 
+        chain = qqq.option_chain(target_date)
+        
+        c_vol = chain.calls['volume'].sum()
+        p_vol = chain.puts['volume'].sum()
+        
+        res['0DTE_Call_Vol'] = c_vol
+        res['0DTE_Put_Vol'] = p_vol
+        res['Expiry_Date'] = target_date
+        
+        # 简单的多空比
+        ratio = p_vol / c_vol if c_vol > 0 else 1
+        if ratio < 0.8: res['0DTE_Sentiment'] = "🟢 Call 主导 (追涨)"
+        elif ratio > 1.2: res['0DTE_Sentiment'] = "🔴 Put 主导 (避险)"
+        else: res['0DTE_Sentiment'] = "⚪ 多空平衡"
+
+    except Exception as e: pass
+    return res
+
+# UI 渲染
+with st.spinner("正在计算 1分钟级 VWAP 与 0DTE 数据..."):
+    tactics = get_intraday_tactics()
+
+# 显示数据时间戳，提醒时效性
+st.caption(f"⚡ 日内数据快照时间: {tactics['Last_Update']} (请手动刷新以获取最新)")
+
+c_day1, c_day2, c_day3, c_day4 = st.columns(4)
+
+# 1. VWAP 趋势
+c_day1.metric("日内 VWAP", f"${tactics['VWAP']:.2f}", tactics['Trend'], delta_color="off")
+
+# 2. 预期波动
+c_day2.metric("今日预期波动", f"±${tactics['Exp_Move']:.2f}", f"上沿 ${tactics['Upper_Band']:.2f}")
+
+# 3. 0DTE 情绪
+c_day3.metric(f"0DTE 情绪 ({tactics.get('Expiry_Date','')})", tactics['0DTE_Sentiment'], f"PCR (Vol): {tactics['0DTE_Put_Vol']/max(1,tactics['0DTE_Call_Vol']):.2f}")
+
+# 4. 现价
+c_day4.metric("QQQ 实时价", f"${tactics['Price']:.2f}", f"距离 VWAP: {((tactics['Price']-tactics['VWAP'])/tactics['VWAP'])*100:.2f}%")
+
+with st.expander("🏹 日内期权狙击指南 (Intraday Cheat Sheet)", expanded=True):
+    st.markdown(f"""
+    *   **判断逻辑**:
+        1.  **看 VWAP**: 价格在 VWAP 之上不做空，之下不做多。
+        2.  **看边界**: 价格触及 `${tactics['Upper_Band']:.2f}` (预期波动上沿) 时，往往动能耗尽，不要追涨。
+        3.  **看 0DTE PCR**: 如果 PCR < 0.7 (极低) 且价格在 VWAP 之下，小心诱多崩盘。
+    *   **⚠️ 注意**: Yahoo 数据可能有延迟。**请以你的券商软件报价为准进行下单**，本面板仅用于判断多空风向。
+    """)
