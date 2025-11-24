@@ -7,7 +7,7 @@ import datetime
 import pytz
 import feedparser
 from transformers import pipeline
-# [新增] 引入自动刷新库
+# 引入自动刷新库
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. 全局配置 ---
@@ -22,15 +22,14 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- [新增] 侧边栏自动刷新控制 ---
+# --- [修改] 侧边栏自动刷新控制 ---
 with st.sidebar:
     st.header("⚙️ 系统状态")
-    # 设置每 120 秒 (2分钟) 刷新一次
-    count = st_autorefresh(interval=120 * 1000, key="data_refresher")
-    st.caption(f"🟢 自动刷新已开启 (2分钟/次)")
+    # 30分钟 = 30 * 60 * 1000 毫秒
+    count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
+    st.caption(f"🟢 自动刷新已开启 (30分钟/次)")
     st.caption(f"已刷新次数: {count}")
     
-    # 添加一个手动刷新按钮方便调试
     if st.button("🔄 立即手动刷新"):
         st.rerun()
 
@@ -40,7 +39,7 @@ with st.sidebar:
 def load_ai_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-# 宏观数据：每天更新一次，保持 1 小时缓存即可
+# 宏观数据：每天更新一次，保持 1 小时缓存
 @st.cache_data(ttl=3600)
 def get_ny_fed_data():
     try:
@@ -53,10 +52,9 @@ def get_ny_fed_data():
         return rates
     except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
-# 宏观数据：每天更新一次
+# 宏观数据：RRP/TGA 每天更新
 @st.cache_data(ttl=3600)
 def get_fed_liquidity():
-    """RRP & TGA (FRED CSV)"""
     res = {"RRP": 0, "RRP_Chg": 0, "TGA": 0, "TGA_Chg": 0}
     try:
         rrp_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD")
@@ -69,8 +67,8 @@ def get_fed_liquidity():
     except: pass
     return res
 
-# 市场数据：改为 120秒 缓存，确保实时性
-@st.cache_data(ttl=120)
+# [修改] 市场数据：缓存改为 1800秒 (30分钟)
+@st.cache_data(ttl=1800)
 def get_credit_spreads():
     try:
         data = yf.download(["HYG", "LQD"], period="5d", progress=False)['Close']
@@ -81,8 +79,8 @@ def get_credit_spreads():
         return curr, pct
     except: return 0, 0
 
-# 市场数据：改为 120秒 缓存
-@st.cache_data(ttl=120)
+# [修改] 市场数据：缓存改为 1800秒
+@st.cache_data(ttl=1800)
 def get_rates_and_fx():
     tickers = ["^IRX", "^TNX", "^TYX", "DX-Y.NYB", "JPY=X", "^MOVE"] 
     res = {}
@@ -101,8 +99,8 @@ def get_rates_and_fx():
         res = {'Yield_2Y':5.0, 'Yield_10Y':4.2, 'Yield_30Y':4.3, 'DXY':104, 'USDJPY':150, 'MOVE':100, 'Inversion':-0.8}
     return res
 
-# 市场数据：改为 120秒 缓存
-@st.cache_data(ttl=120)
+# [修改] 市场数据：缓存改为 1800秒
+@st.cache_data(ttl=1800)
 def get_volatility_indices():
     data = {}
     try:
@@ -117,8 +115,8 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-# 衍生品数据：改为 120秒 缓存 (GEX 需要跟随股价变动)
-@st.cache_data(ttl=120)
+# [修改] 衍生品数据：缓存改为 1800秒
+@st.cache_data(ttl=1800)
 def get_derivatives_structure():
     """获取 期货基差 + GEX 模型"""
     res = {
@@ -168,8 +166,8 @@ def get_derivatives_structure():
     except Exception as e: pass
     return res
 
-# 期权数据：改为 120秒 缓存 (捕捉实时成交量)
-@st.cache_data(ttl=120)
+# [修改] 期权数据：缓存改为 1800秒
+@st.cache_data(ttl=1800)
 def get_qqq_options_data():
     """PCR & Unusual Radar"""
     qqq = yf.Ticker("QQQ")
@@ -212,8 +210,8 @@ def get_macro_calendar():
         if 0 <= days <= 45: upcoming.append({**e, "Days": days})
     return sorted(upcoming, key=lambda x: x['Days'])
 
-# 新闻：设置为 300秒 (5分钟) 缓存，防止 RSS 源封禁 IP
-@st.cache_data(ttl=300)
+# [修改] 新闻：缓存改为 1800秒 (30分钟)
+@st.cache_data(ttl=1800)
 def get_macro_news():
     feeds = [
         ("CNBC Economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
@@ -285,7 +283,7 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
 
 # --- 3. 界面渲染 (UI) ---
 
-with st.spinner("正在同步全球市场实时数据 (2分钟刷新)..."):
+with st.spinner("正在同步全球市场数据 (30分钟刷新)..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
     fed_liq = get_fed_liquidity()
@@ -319,7 +317,7 @@ with st.spinner("正在同步全球市场实时数据 (2分钟刷新)..."):
 # --- HEADER ---
 st.title("🦅 QQQ 宏观战情室 Pro (Live)")
 current_time = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M EST')
-st.caption(f"上次更新: {current_time} | 自动刷新: 开启 (120s)")
+st.caption(f"上次更新: {current_time} | 自动刷新: 开启 (30分钟)")
 
 col_score, col_text = st.columns([1, 3])
 with col_score:
