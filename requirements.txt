@@ -10,3 +10,4 @@ pytz
 plotly
 fredapi
 beautifulsoup4
+streamlit-autorefresh
