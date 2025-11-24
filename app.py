@@ -20,10 +20,14 @@ st.markdown("""
     .news-card {padding: 10px; margin-bottom: 5px; border-radius: 5px; border-left: 5px solid #ccc;}
     .news-bull {background-color: #e6fffa; border-left-color: #00c04b;}
     .news-bear {background-color: #fff5f5; border-left-color: #ff4b4b;}
+    .summary-box {padding: 15px; border-radius: 10px; margin-bottom: 20px;}
+    .summary-bull {background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb;}
+    .summary-bear {background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;}
+    .summary-neutral {background-color: #e2e3e5; color: #383d41; border: 1px solid #d6d8db;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- [侧边栏] 配置 ---
+# --- [侧边栏] ---
 with st.sidebar:
     st.header("⚙️ 设置")
     av_api_key = st.text_input("AlphaVantage API Key", value="UMWB63OXOOCIZHXR", type="password")
@@ -34,7 +38,7 @@ with st.sidebar:
     if st.button("🔄 立即刷新"):
         st.rerun()
 
-# --- 1. 核心模型与数据获取 ---
+# --- 1. 核心数据获取 ---
 
 @st.cache_resource
 def load_ai_model():
@@ -72,29 +76,59 @@ def get_fed_liquidity():
 def get_credit_spreads():
     try:
         data = yf.download(["HYG", "LQD"], period="5d", progress=False)['Close']
-        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.droplevel(0)
+        # 修复 MultiIndex 问题
+        if isinstance(data.columns, pd.MultiIndex): 
+            data.columns = data.columns.get_level_values(0)
+            
         ratio = data['HYG'] / data['LQD']
         curr = ratio.iloc[-1]
         pct = ((curr - ratio.iloc[-2]) / ratio.iloc[-2]) * 100
         return curr, pct
-    except: return 0, 0
+    except Exception as e: 
+        return 0, 0
 
+# [修复] 美债数据抓取
 @st.cache_data(ttl=1800)
 def get_rates_and_fx():
+    # 注意: ^TNX 是 10年期利率指数 (44.5 = 4.45%)
+    # ^IRX 是 13周利率 (做短端代理)
     tickers = ["^IRX", "^TNX", "^TYX", "DX-Y.NYB", "JPY=X", "^MOVE"] 
-    res = {}
+    res = {
+        'Yield_2Y': 0, 'Yield_10Y': 0, 'Inversion': 0,
+        'DXY': 0, 'USDJPY': 0, 'MOVE': 0
+    }
     try:
         df = yf.download(tickers, period="5d", progress=False)['Close']
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(0)
-        res['Yield_2Y'] = df.get('^IRX', pd.Series([5.2])).iloc[-1]
-        res['Yield_10Y'] = df.get('^TNX', pd.Series([4.2])).iloc[-1]
-        res['Yield_30Y'] = df.get('^TYX', pd.Series([4.4])).iloc[-1]
-        res['DXY'] = df.get('DX-Y.NYB', pd.Series([104])).iloc[-1]
-        res['USDJPY'] = df.get('JPY=X', pd.Series([150])).iloc[-1]
-        res['MOVE'] = df.get('^MOVE', pd.Series([100.0])).iloc[-1]
-        res['Inversion'] = res['Yield_10Y'] - res['Yield_2Y']
-    except:
-        res = {'Yield_2Y':5.0, 'Yield_10Y':4.2, 'Yield_30Y':4.3, 'DXY':104, 'USDJPY':150, 'MOVE':100, 'Inversion':-0.8}
+        
+        # 核心修复: 处理 yfinance 列名结构
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        # 赋值并清洗
+        # 10Y
+        if '^TNX' in df.columns:
+            res['Yield_10Y'] = df['^TNX'].iloc[-1] # Yahoo 返回的是指数值，如 44.2
+        
+        # 2Y (用 ^IRX 13周 或 ^FVX 5年 作为短端参考，因为 ^2-Year 经常缺失)
+        # 这里为了计算倒挂，我们用 ^IRX (短端) 近似，或者尝试获取
+        if '^IRX' in df.columns:
+            res['Yield_2Y'] = df['^IRX'].iloc[-1]
+            
+        # 倒挂计算
+        if res['Yield_10Y'] and res['Yield_2Y']:
+            res['Inversion'] = res['Yield_10Y'] - res['Yield_2Y']
+            
+        if 'DX-Y.NYB' in df.columns: res['DXY'] = df['DX-Y.NYB'].iloc[-1]
+        if 'JPY=X' in df.columns: res['USDJPY'] = df['JPY=X'].iloc[-1]
+        
+        # MOVE 指数 (Yahoo 数据可能不全，兜底)
+        if '^MOVE' in df.columns and not pd.isna(df['^MOVE'].iloc[-1]):
+            res['MOVE'] = df['^MOVE'].iloc[-1]
+        else:
+            res['MOVE'] = 100.0 # 默认值防止报错
+
+    except Exception as e:
+        print(f"Bond Data Error: {e}")
     return res
 
 @st.cache_data(ttl=1800)
@@ -112,20 +146,20 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-# --- [修复] Gamma Flip / Wall 聚合算法 ---
+# --- [重构] Gamma 状态与 Wall 抓取 ---
 @st.cache_data(ttl=1800)
 def get_derivatives_structure():
     res = {
         "Futures_Basis": 0, "Basis_Status": "Normal", 
         "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, 
-        "Flip_Line": 0, "Current_Price": 0,
         "Vanna_Charm_Proxy": "Neutral",
-        "Data_Note": ""
+        "Current_Price": 0
     }
     try:
-        # 1. 基础价格
+        # 1. 期货基差
         market_data = yf.download(["NQ=F", "^NDX", "QQQ"], period="2d", progress=False)['Close']
-        if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.droplevel(0)
+        if isinstance(market_data.columns, pd.MultiIndex): 
+            market_data.columns = market_data.columns.get_level_values(0)
         
         fut = market_data['NQ=F'].iloc[-1]
         spot = market_data['^NDX'].iloc[-1]
@@ -134,14 +168,14 @@ def get_derivatives_structure():
         
         basis = fut - spot
         res['Futures_Basis'] = basis
-        if basis < -10: res['Basis_Status'] = "🔴 Backwardation"
-        elif basis > 50: res['Basis_Status'] = "🟢 Contango"
-        else: res['Basis_Status'] = "⚪ Flat"
+        if basis < -15: res['Basis_Status'] = "🔴 Backwardation (极度看空)"
+        elif basis > 60: res['Basis_Status'] = "🟢 Contango (正常/看多)"
+        else: res['Basis_Status'] = "⚪ Neutral (中性)"
         
-        # 2. [核心修复] 聚合多期权链计算 Wall
+        # 2. Gamma 结构 (聚合计算)
         qqq = yf.Ticker("QQQ")
-        # 获取最近的 4 个到期日 (覆盖周权和月权)
-        expirations = qqq.options[:4] 
+        # 抓取最近 3 个到期日 (Front Month 影响力最大)
+        expirations = qqq.options[:3] 
         
         all_calls = []
         all_puts = []
@@ -149,71 +183,65 @@ def get_derivatives_structure():
         for date in expirations:
             try:
                 chain = qqq.option_chain(date)
-                # 必须清洗数据: 填充 NaN 为 0
                 c = chain.calls.fillna(0)
                 p = chain.puts.fillna(0)
-                all_calls.append(c[['strike', 'openInterest', 'volume']])
-                all_puts.append(p[['strike', 'openInterest', 'volume']])
-            except:
-                continue
+                # 过滤掉 OI 极小的噪音 (例如 < 100 张)
+                c = c[c['openInterest'] > 100]
+                p = p[p['openInterest'] > 100]
+                all_calls.append(c[['strike', 'openInterest']])
+                all_puts.append(p[['strike', 'openInterest']])
+            except: continue
         
         if all_calls and all_puts:
-            # 合并数据
             df_calls = pd.concat(all_calls)
             df_puts = pd.concat(all_puts)
             
-            # 按 Strike 聚合求和 OI
+            # 聚合 OI
             total_calls = df_calls.groupby('strike')['openInterest'].sum()
             total_puts = df_puts.groupby('strike')['openInterest'].sum()
             
-            # 找到聚合后的最大持仓位
+            # 寻找 Wall (绝对最大 OI)
             res['Call_Wall'] = total_calls.idxmax()
             res['Put_Wall'] = total_puts.idxmax()
             
-            # 3. 计算 Flip Line
-            # 算法: Call OI - Put OI 的差值 (Net Gamma Proxy)
-            # 对齐索引
-            combined = pd.DataFrame({'Call_OI': total_calls, 'Put_OI': total_puts}).fillna(0)
-            combined['Net_OI'] = combined['Call_OI'] - combined['Put_OI']
+            # [新逻辑] Gamma 状态判定
+            # 不计算具体 Flip Line，而是比较 ATM (平值) 附近的 Gamma 偏向
+            # 取现价 ±2% 范围内的期权
+            range_min = qqq_price * 0.98
+            range_max = qqq_price * 1.02
             
-            # 寻找符号翻转点 (从正变负的地方)
-            # 或者寻找 Net OI 最接近 0 的点 (在 Put Wall 和 Call Wall 之间)
-            # 简单算法: 寻找 Put OI 开始超过 Call OI 的关键点
-            flip_candidates = combined[combined['Net_OI'] < 0]
-            if not flip_candidates.empty:
-                # 找最接近现价的翻转点
-                flip_strike = flip_candidates.index[0] # 简易取第一个
-                # 优化: 在现价附近找
-                near_price = flip_candidates.index[abs(flip_candidates.index - qqq_price).argmin()]
-                res['Flip_Line'] = near_price
+            calls_atm = total_calls[(total_calls.index >= range_min) & (total_calls.index <= range_max)].sum()
+            puts_atm = total_puts[(total_puts.index >= range_min) & (total_puts.index <= range_max)].sum()
+            
+            # 如果 ATM 附近 Put OI 显著大于 Call OI -> 负 Gamma
+            gamma_ratio = puts_atm / max(1, calls_atm)
+            
+            if qqq_price < res['Put_Wall']:
+                res['GEX_Net'] = "🔴 Negative Gamma (Crash Risk)"
+            elif qqq_price > res['Call_Wall']:
+                res['GEX_Net'] = "🟢 Positive Gamma (Breakout)"
             else:
-                res['Flip_Line'] = res['Put_Wall'] # 兜底
-                
-            # GEX 状态判定
-            if qqq_price < res['Flip_Line']: res['GEX_Net'] = "🔴 Negative (高波)"
-            else: res['GEX_Net'] = "🟢 Positive (低波)"
-            
-            res['Data_Note'] = f"聚合了 {len(expirations)} 个到期日"
-            
-        # Vanna
+                # 在 Wall 之间，看 ATM 偏向
+                if gamma_ratio > 1.2:
+                     res['GEX_Net'] = "🟠 Weak Negative (震荡偏弱)"
+                else:
+                     res['GEX_Net'] = "🟢 Positive Gamma (震荡偏强)"
+
+        # Vanna/Charm
         if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
             res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
         else: res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
 
     except Exception as e: 
-        res['Data_Note'] = "数据获取失败"
-        print(e)
+        print(f"Deriv Error: {e}")
     return res
 
-# --- [修复] PCR 计算也改为聚合模式 ---
 @st.cache_data(ttl=1800)
 def get_qqq_options_data():
     qqq = yf.Ticker("QQQ")
     res = {"PCR": 0.0, "Unusual": []}
     try:
-        # 同样聚合前 4 个到期日，样本量更大更准
-        expirations = qqq.options[:4]
-        
+        expirations = qqq.options[:3]
         total_c_vol = 0
         total_p_vol = 0
         unusual = []
@@ -223,34 +251,27 @@ def get_qqq_options_data():
                 chain = qqq.option_chain(date)
                 calls = chain.calls.fillna(0)
                 puts = chain.puts.fillna(0)
-                
                 total_c_vol += calls['volume'].sum()
                 total_p_vol += puts['volume'].sum()
                 
-                # 异动扫描 (只保留真正的大单)
+                # 异动扫描: 量大且 Vol > OI
                 for opt_type, df, icon in [("CALL", calls, "🟢"), ("PUT", puts, "🔴")]:
-                    # 提高阈值: 成交量 > 1000
-                    hot = df[(df['volume'] > 1000) & (df['volume'] > df['openInterest'] * 1.5)]
+                    hot = df[(df['volume'] > 2000) & (df['volume'] > df['openInterest'] * 1.2)]
                     for _, row in hot.iterrows():
                         unusual.append({
-                            "Type": f"{icon} {opt_type}", 
-                            "Strike": row['strike'],
-                            "Exp": date, # 加上日期
-                            "Vol": int(row['volume']), 
-                            "OI": int(row['openInterest']),
+                            "Type": f"{icon} {opt_type}", "Strike": row['strike'], "Exp": date,
+                            "Vol": int(row['volume']), "OI": int(row['openInterest']),
                             "Ratio": round(row['volume'] / (row['openInterest']+1), 1)
                         })
             except: continue
             
         if total_c_vol > 0: 
             res['PCR'] = round(total_p_vol / total_c_vol, 2)
-            
-        # 按成交量排序取前 15
-        res['Unusual'] = sorted(unusual, key=lambda x: x['Vol'], reverse=True)[:15]
+        res['Unusual'] = sorted(unusual, key=lambda x: x['Vol'], reverse=True)[:10]
     except: pass
     return res
 
-# 日历 (Alpha Vantage)
+# 日历
 @st.cache_data(ttl=3600)
 def get_macro_calendar(api_key=""):
     if api_key:
@@ -276,12 +297,10 @@ def get_macro_calendar(api_key=""):
     next_cpi = today.replace(day=12) 
     if today.day > 12: next_cpi = (next_month - datetime.timedelta(days=1)).replace(day=12)
     events.append({"Date": next_cpi, "Event": "CPI (Est)", "Type": "Inflation"})
-    
     events = sorted(events, key=lambda x: x['Date'])
     df = pd.DataFrame(events)
     df = df[df['Date'] >= today].head(5)
-    d_df = df.copy()
-    d_df['Time']="--"; d_df['Est']="--"; d_df['Prev']="--"
+    d_df = df.copy(); d_df['Time']="--"; d_df['Est']="--"; d_df['Prev']="--"
     return d_df[['Date','Time','Event','Est','Prev']], "Estimated"
 
 @st.cache_data(ttl=1800)
@@ -299,63 +318,104 @@ def get_macro_news():
         except: pass
     return pd.DataFrame(articles)
 
-# --- 2. 核心算法 ---
+# --- 2. [重写] 核心算法与综述生成 ---
 
 def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_score_val):
     score = 0
-    details = []
+    flags = [] # 异常信号收集
     
-    # 流动性 (25%)
+    # 1. 流动性 (权重 25%)
     liq_score = 0
     spread = ny_fed['SOFR'] - ny_fed['TGCR']
-    if spread > 0.05: liq_score -= 1.0; details.append("🔴 SOFR 异常")
+    if spread > 0.05: 
+        liq_score -= 1.0; flags.append("🔴 流动性紧缺 (SOFR > Repo)")
     elif spread < 0.02: liq_score += 0.5
-    if fed_liq['RRP_Chg'] > 20: liq_score -= 0.5; details.append("🔴 RRP 抽水")
-    if fed_liq['TGA_Chg'] > 20: liq_score -= 0.5; details.append("🔴 TGA 抽水")
-    if credit[1] < -0.5: liq_score -= 0.5
+    
+    if fed_liq['RRP_Chg'] > 20: 
+        liq_score -= 0.5; flags.append("🔴 RRP 抽水")
+    if fed_liq['TGA_Chg'] > 20: 
+        liq_score -= 0.5; flags.append("🔴 TGA 抽水")
+        
+    if credit[1] < -0.5: 
+        liq_score -= 0.5; flags.append("🔴 HYG/LQD 避险模式")
+    elif credit[1] > 0.2: liq_score += 0.5
+    
     score += max(-2.5, min(2.5, liq_score))
     
-    # 美债 (25%)
+    # 2. 美债 (权重 25%)
     bond_score = 0
-    if rates['Yield_10Y'] > 4.5: bond_score -= 1.0
+    if rates['Yield_10Y'] > 4.5: 
+        bond_score -= 1.0; flags.append("🔴 10Y 美债收益率过高")
     elif rates['Yield_10Y'] < 4.0: bond_score += 1.0
-    if rates['MOVE'] > 110: bond_score -= 1.5
+    
+    if rates['MOVE'] > 110: 
+        bond_score -= 1.5; flags.append("🔴 MOVE 债市恐慌")
+    
+    if rates['Inversion'] < -0.5: 
+        flags.append("⚠️ 收益率曲线深度倒挂")
+        
     score += max(-2.5, min(2.5, bond_score))
     
-    # 恐慌 (15%)
+    # 3. 恐慌 (权重 15%)
     fear_score = 0
-    if vol['VIX'] > 25: fear_score -= 1.0
-    elif vol['VIX'] < 13: fear_score -= 0.5
-    if vol['Crypto_Val'] < 20: fear_score += 0.5
+    if vol['VIX'] > 25: 
+        fear_score -= 1.0; flags.append("🔴 VIX 恐慌模式")
+    elif vol['VIX'] < 13: 
+        fear_score -= 0.5; flags.append("⚠️ VIX 过低 (自满)")
+        
+    if vol['Crypto_Val'] < 20: 
+        fear_score += 0.5; flags.append("🟢 币圈极度恐慌 (反向做多)")
     score += fear_score
     
-    # 交易 (20%)
+    # 4. 交易与微观 (权重 20%)
     trade_score = 0
-    if opt['PCR'] > 1.1: trade_score -= 0.5; details.append("📉 PCR 偏空")
-    elif opt['PCR'] < 0.7: trade_score += 0.5
-    if deriv['Basis_Status'].startswith("🔴"): trade_score -= 1.0; details.append("🔴 期货贴水")
-    if deriv['GEX_Net'].startswith("🔴"): trade_score -= 0.5; details.append("🔴 跌破 Gamma Flip")
-    elif deriv['GEX_Net'].startswith("🟢"): trade_score += 0.5
+    if opt['PCR'] > 1.2: 
+        trade_score -= 0.5; flags.append("📉 PCR 极高 (看空拥挤)")
+    elif opt['PCR'] < 0.6: 
+        trade_score += 0.5; flags.append("📈 PCR 极低 (看多拥挤)")
+        
+    if deriv['Basis_Status'].startswith("🔴"): 
+        trade_score -= 1.0; flags.append("🔴 期货贴水 (资金出逃)")
+        
+    if "Negative" in deriv['GEX_Net']: 
+        trade_score -= 0.5; flags.append("🔴 负 Gamma (波动放大)")
+    
     score += max(-2.0, min(2.0, trade_score))
     
-    # 新闻 (15%)
+    # 5. 新闻 (15%)
     score += news_score_val * 1.5
     
-    return round(score * (10 / 7.5), 1), details
+    # --- 生成综述文案 ---
+    final_score = round(score * (10 / 7.5), 1)
+    
+    summary_text = ""
+    action_plan = ""
+    
+    if final_score > 3:
+        summary_text = "宏观环境**偏多 (Bullish)**，流动性与情绪配合良好。"
+        action_plan = "✅ **操作建议**: 逢低做多 (Buy Dips)，关注 Call Wall 阻力位。"
+    elif final_score < -3:
+        summary_text = "宏观环境**偏空 (Bearish)**，市场面临流动性或恐慌压力。"
+        action_plan = "🛡️ **操作建议**: 现金为王，反弹做空，关注 Put Wall 支撑位。"
+    else:
+        summary_text = "宏观环境**中性震荡 (Neutral)**，多空信号交织。"
+        action_plan = "⚖️ **操作建议**: 高抛低吸，避免追涨杀跌，以日内交易为主。"
+        
+    if not flags: flags.append("暂无显著异常指标")
+    
+    return final_score, flags, summary_text, action_plan
 
 # --- 3. UI ---
 
-with st.spinner("正在聚合多期权链数据 (30分钟刷新)..."):
+with st.spinner("正在聚合全市场数据 (30分钟刷新)..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
     fed_liq = get_fed_liquidity()
     credit = get_credit_spreads()
     rates = get_rates_and_fx()
     vol = get_volatility_indices()
-    # 核心数据源
     opt = get_qqq_options_data()
     deriv = get_derivatives_structure()
-    
     cal_df, cal_source = get_macro_calendar(av_api_key)
     raw_news = get_macro_news()
 
@@ -376,26 +436,24 @@ with st.spinner("正在聚合多期权链数据 (30分钟刷新)..."):
         avg_news_score = sentiment_total / max(1, len(processed_news))
     else: avg_news_score = 0
 
-    final_score, reasons = calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, avg_news_score)
+    final_score, flags, summary_text, action_plan = calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, avg_news_score)
 
 # --- HEADER ---
 st.title("🦅 QQQ 宏观战情室 Pro (Live)")
 current_time = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M EST')
 st.caption(f"上次更新: {current_time} | 自动刷新: 开启 (30分钟)")
 
-col_score, col_text = st.columns([1, 3])
-with col_score:
-    color = "red" if final_score < -3 else "green" if final_score > 3 else "gray"
-    st.metric("大盘多空综评 (-10 ~ +10)", f"{final_score}", delta_color="off")
-    if final_score > 3: st.success("### 偏多 (Bullish)")
-    elif final_score < -3: st.error("### 偏空 (Bearish)")
-    else: st.info("### 中性震荡 (Neutral)")
-
-with col_text:
-    st.markdown("#### 🛡️ 战情综述")
-    st.write("驱动因子: " + " | ".join(reasons))
-    if fed_liq['RRP_Chg'] > 100:
-        st.warning("⚠️ 严重警告: RRP 激增，市场流动性正在快速枯竭！")
+# [重写] 战情综述板块
+summary_class = "summary-bull" if final_score > 3 else "summary-bear" if final_score < -3 else "summary-neutral"
+st.markdown(f"""
+<div class="summary-box {summary_class}">
+    <h3>🛡️ 战情综述 (Score: {final_score})</h3>
+    <p style="font-size:1.1em;">{summary_text}</p>
+    <p><strong>🚨 异常指标监控:</strong> { '  |  '.join(flags) }</p>
+    <hr style="border-top: 1px dashed #ccc;">
+    <p style="font-weight:bold;">{action_plan}</p>
+</div>
+""", unsafe_allow_html=True)
 
 st.divider()
 
@@ -406,66 +464,55 @@ l1.metric("SOFR", f"{ny_fed['SOFR']:.2f}%", f"Spread: {ny_fed['SOFR'] - ny_fed['
 l2.metric("Repo (TGCR)", f"{ny_fed['TGCR']:.2f}%")
 l3.metric("RRP (逆回购)", f"${fed_liq['RRP']:.0f}B", f"{fed_liq['RRP_Chg']:.0f}B", delta_color="inverse")
 l4.metric("TGA (财政部)", f"${fed_liq['TGA']:.0f}B", f"{fed_liq['TGA_Chg']:.0f}B", delta_color="inverse")
-l5.metric("HYG/LQD", f"{credit[0]:.3f}", f"{credit[1]:.2f}%")
+l5.metric("HYG/LQD", f"{credit[0]:.3f}", f"{credit[1]:.2f}%", help="HYG(高收益)/LQD(投资级)比率。上升代表风险偏好上升(Risk On)，下降代表避险(Risk Off)。")
 
 st.divider()
 
 # 2. 美债
 st.subheader("2. 美债与汇率 (Rates & FX)")
 r1, r2, r3, r4, r5 = st.columns(5)
-r1.metric("10Y 美债收益率", f"{rates['Yield_10Y']:.2f}%")
-r2.metric("MOVE (债市恐慌)", f"{rates['MOVE']:.2f}")
-r3.metric("2Y/10Y 倒挂", f"{rates['Inversion']:.2f}%")
+r1.metric("10Y 美债收益率", f"{rates['Yield_10Y']:.2f}%", help="全球资产定价之锚。收益率过高(>4.5%)通常利空科技股。")
+r2.metric("MOVE (债市恐慌)", f"{rates['MOVE']:.2f}", help="美债波动率指数。>110 代表债市极度恐慌，通常伴随股市下跌。")
+r3.metric("2Y/10Y 倒挂", f"{rates['Inversion']:.2f}%", help="经济衰退的前瞻指标。负值越深，衰退概率越大。")
 r4.metric("美元指数 (DXY)", f"{rates['DXY']:.2f}")
 r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# 3. 交易与微观结构 (聚合版)
+# 3. 交易与微观结构
 st.subheader("3. 交易与微观结构 (Aggregated Options & GEX)")
-st.caption(f"数据说明: 已聚合未来 4 个到期日 (包含月权) 的 OI 数据，解决 0DTE 数据缺失问题。")
-
 t1, t2, t3, t4 = st.columns(4)
+
 t1.metric("QQQ 期权 PCR", f"{opt['PCR']}", "Put/Call Ratio")
 t2.metric("VIX 股市恐慌", f"{vol['VIX']:.2f}")
 t3.metric("币圈恐慌指数", f"{vol['Crypto_Val']}", f"{vol['Crypto_Text']}")
-t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'])
+t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'], help="期货价格减去现货价格。正数(Contango)为正常；负数(Backwardation)代表极度恐慌或对冲需求。")
 
 g1, g2, g3 = st.columns(3)
-g1.metric("Gamma Flip Line (聚合自算)", f"${deriv['Flip_Line']:.2f}", deriv['GEX_Net'], delta_color="off")
-g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "Total OI Max")
-g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "Total OI Max")
+g1.metric("Gamma 状态", deriv['GEX_Net'], help="🟢 Positive: 做市商高抛低吸，抑制波动。\n🔴 Negative: 做市商追涨杀跌，放大波动。")
+g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "Total OI Max", help="下方最大的 Put 持仓位，通常是极强的支撑位。")
+g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "Total OI Max", help="上方最大的 Call 持仓位，通常是极强的阻力位。")
 
-with st.expander("📚 交易员参考手册：如何解读 PCR (OI)？", expanded=False):
-    st.markdown("""
-    #### 1. 数值 > 1.2 (高位 - 极度悲观)
-    *   **直观感觉**: 大家都看空。做市商手里全是 Short Put (Long Delta)。
-    *   **🛡️ 操作**: 只要 QQQ 没崩，意味着底部支撑强。反弹时做市商必须买回对冲。**反向做多信号。**
-    #### 2. 数值 < 0.7 (低位 - 极度贪婪)
-    *   **直观感觉**: 大家都看多。做市商手里全是 Short Call (Short Delta)。
-    *   **⚠️ 操作**: 上涨吃力 (Call Wall 阻力)。**反向做空/止盈信号。**
+with st.expander("📚 交易员参考手册：如何解读 PCR & Vanna？", expanded=False):
+    st.markdown(f"""
+    #### 1. HYG/LQD (信贷利差)
+    *   **含义**: 垃圾债 vs 投资级债。比率上升 = 资金愿意冒险 (Risk On)；比率下降 = 资金避险 (Risk Off)。
+    
+    #### 2. Vanna & Charm ({deriv['Vanna_Charm_Proxy']})
+    *   **原理**: 当 VIX 下跌或时间流逝时，做市商的期权 Delta 会发生变化。
+    *   **Tailwind (助涨)**: 市场上涨且 VIX 下跌时，做市商需要买回之前的空单，推升股价。
+    *   **Headwind (阻力)**: 市场下跌且 VIX 飙升时，做市商需要抛售，加速下跌。
     """)
 
-with st.expander("查看 QQQ 异动雷达与 Vanna/Charm 状态", expanded=True):
-    c_ex1, c_ex2 = st.columns([2, 1])
-    with c_ex1:
-        st.write("**⚡ 异动雷达 (Aggregated Volume > 1000)**")
-        if opt['Unusual']: 
-            st.dataframe(
-                pd.DataFrame(opt['Unusual']), 
-                column_config={"Exp": "到期日"},
-                use_container_width=True
-            )
-        else: st.info("今日无显著异动。")
-    with c_ex2:
-        st.write("**Greek Flows (Proxy)**")
-        st.info(f"🔮 Vanna/Charm 状态: **{deriv['Vanna_Charm_Proxy']}**")
-        st.caption("注: 若VIX下跌，Dealer解套Call，形成Vanna助涨；若VIX暴涨则反之。")
+with st.expander("查看 QQQ 异动雷达 (Volume > OI)", expanded=True):
+    if opt['Unusual']: 
+        st.dataframe(pd.DataFrame(opt['Unusual']), use_container_width=True)
+    else: st.info("今日无显著异动。")
 
 st.divider()
 
 # 4. 新闻
-st.subheader("4. 宏观新闻情报 (AI Sentiment)")
+st.subheader("4. 宏观新闻情报")
 col_news_list, col_news_stat = st.columns([3, 1])
 with col_news_list:
     if processed_news:
