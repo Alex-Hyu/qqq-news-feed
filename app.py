@@ -7,7 +7,6 @@ import datetime
 import pytz
 import feedparser
 from transformers import pipeline
-# 引入自动刷新库
 from streamlit_autorefresh import st_autorefresh
 
 # --- 0. 全局配置 ---
@@ -22,14 +21,10 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- [修改] 侧边栏自动刷新控制 ---
 with st.sidebar:
     st.header("⚙️ 系统状态")
-    # 30分钟 = 30 * 60 * 1000 毫秒
     count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
     st.caption(f"🟢 自动刷新已开启 (30分钟/次)")
-    st.caption(f"已刷新次数: {count}")
-    
     if st.button("🔄 立即手动刷新"):
         st.rerun()
 
@@ -39,7 +34,6 @@ with st.sidebar:
 def load_ai_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-# 宏观数据：每天更新一次，保持 1 小时缓存
 @st.cache_data(ttl=3600)
 def get_ny_fed_data():
     try:
@@ -52,7 +46,6 @@ def get_ny_fed_data():
         return rates
     except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
-# 宏观数据：RRP/TGA 每天更新
 @st.cache_data(ttl=3600)
 def get_fed_liquidity():
     res = {"RRP": 0, "RRP_Chg": 0, "TGA": 0, "TGA_Chg": 0}
@@ -60,14 +53,12 @@ def get_fed_liquidity():
         rrp_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD")
         res['RRP'] = rrp_df.iloc[-1]['RRPONTSYD']
         res['RRP_Chg'] = res['RRP'] - rrp_df.iloc[-2]['RRPONTSYD']
-        
         tga_df = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN")
         res['TGA'] = tga_df.iloc[-1]['WTREGEN']
         res['TGA_Chg'] = res['TGA'] - tga_df.iloc[-2]['WTREGEN']
     except: pass
     return res
 
-# [修改] 市场数据：缓存改为 1800秒 (30分钟)
 @st.cache_data(ttl=1800)
 def get_credit_spreads():
     try:
@@ -79,7 +70,6 @@ def get_credit_spreads():
         return curr, pct
     except: return 0, 0
 
-# [修改] 市场数据：缓存改为 1800秒
 @st.cache_data(ttl=1800)
 def get_rates_and_fx():
     tickers = ["^IRX", "^TNX", "^TYX", "DX-Y.NYB", "JPY=X", "^MOVE"] 
@@ -87,7 +77,6 @@ def get_rates_and_fx():
     try:
         df = yf.download(tickers, period="5d", progress=False)['Close']
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(0)
-        
         res['Yield_2Y'] = df.get('^IRX', pd.Series([5.2])).iloc[-1]
         res['Yield_10Y'] = df.get('^TNX', pd.Series([4.2])).iloc[-1]
         res['Yield_30Y'] = df.get('^TYX', pd.Series([4.4])).iloc[-1]
@@ -99,7 +88,6 @@ def get_rates_and_fx():
         res = {'Yield_2Y':5.0, 'Yield_10Y':4.2, 'Yield_30Y':4.3, 'DXY':104, 'USDJPY':150, 'MOVE':100, 'Inversion':-0.8}
     return res
 
-# [修改] 市场数据：缓存改为 1800秒
 @st.cache_data(ttl=1800)
 def get_volatility_indices():
     data = {}
@@ -115,49 +103,84 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-# [修改] 衍生品数据：缓存改为 1800秒
+# --- [重点] 自算 Gamma Flip 核心算法 ---
 @st.cache_data(ttl=1800)
 def get_derivatives_structure():
-    """获取 期货基差 + GEX 模型"""
+    """获取 期货基差 + GEX 模型 + 自算 Flip Line"""
     res = {
         "Futures_Basis": 0, "Basis_Status": "Normal", 
-        "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, "Zero_Gamma": 0,
+        "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, 
+        "Flip_Line": 0, "Current_Price": 0,
         "Vanna_Charm_Proxy": "Neutral"
     }
     try:
+        # 1. 价格与基差
         market_data = yf.download(["NQ=F", "^NDX", "QQQ"], period="2d", progress=False)['Close']
         if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.droplevel(0)
         
         fut = market_data['NQ=F'].iloc[-1]
         spot = market_data['^NDX'].iloc[-1]
         qqq_price = market_data['QQQ'].iloc[-1]
+        res['Current_Price'] = qqq_price
         
         basis = fut - spot
         res['Futures_Basis'] = basis
-        
-        if basis < -10: res['Basis_Status'] = "🔴 Backwardation (Fear)"
-        elif basis > 50: res['Basis_Status'] = "🟢 Contango (Normal)"
+        if basis < -10: res['Basis_Status'] = "🔴 Backwardation"
+        elif basis > 50: res['Basis_Status'] = "🟢 Contango"
         else: res['Basis_Status'] = "⚪ Flat"
         
+        # 2. GEX 计算
         qqq = yf.Ticker("QQQ")
-        exp = qqq.options[0]
+        exp = qqq.options[0] # 最近到期日
         chain = qqq.option_chain(exp)
         calls = chain.calls
         puts = chain.puts
         
-        max_call_oi_idx = calls['openInterest'].idxmax()
-        max_put_oi_idx = puts['openInterest'].idxmax()
+        # 2.1 基础墙
+        res['Call_Wall'] = calls.loc[calls['openInterest'].idxmax()]['strike']
+        res['Put_Wall'] = puts.loc[puts['openInterest'].idxmax()]['strike']
         
-        res['Call_Wall'] = calls.iloc[max_call_oi_idx]['strike']
-        res['Put_Wall'] = puts.iloc[max_put_oi_idx]['strike']
+        # 2.2 [新增] 估算 Zero Gamma Flip Line
+        # 算法: 寻找 Call OI 和 Put OI 累计影响的平衡点
+        # 简化模型: Flip Line 往往位于 Put Wall 附近，或 Max Pain 附近
+        # 我们使用 "OI 加权中值" 作为近似
+        calls['G_Contribution'] = calls['openInterest'] # 正 Gamma 近似
+        puts['G_Contribution'] = puts['openInterest'] * -1 # 负 Gamma 近似
         
-        if qqq_price > res['Call_Wall']:
-            res['GEX_Net'] = "🟢 Positive (Vol Suppressed)"
-        elif qqq_price < res['Put_Wall']:
-            res['GEX_Net'] = "🔴 Negative (Vol Expansion)"
+        # 合并所有 Strike 的 Gamma 贡献
+        merged = pd.concat([calls[['strike', 'G_Contribution']], puts[['strike', 'G_Contribution']]])
+        gamma_profile = merged.groupby('strike').sum().sort_index()
+        
+        # 找到由正转负的那个 Strike (Zero Crossing)
+        # 通常是从高价(Call主导)跌到低价(Put主导)的过程
+        flip_strike = 0
+        
+        # 简单粗暴法: 找到 Put OI 巨大的那个区域的上方一点点
+        # 这里的近似逻辑: 当 Put OI 开始显著大于 Call OI 时，Gamma 转负
+        for index, row in gamma_profile.iterrows():
+            if row['G_Contribution'] < 0: # 净 Put 主导
+                flip_strike = index
+                # 往上找第一个 Call 主导的作为边界
+                break
+        
+        # 修正: 如果找不到，就用 Put Wall 作为最强 Flip Line
+        if flip_strike == 0:
+            res['Flip_Line'] = res['Put_Wall']
         else:
-            res['GEX_Net'] = "🟢 Positive (Zone)"
+            # 取 Put Wall 和 理论翻转点的均值，平滑数据
+            res['Flip_Line'] = (res['Put_Wall'] + flip_strike) / 2
             
+        # 强制修正: Flip Line 通常不会离现价太远，如果数据异常，回退到 Put Wall
+        if abs(res['Flip_Line'] - qqq_price) > 50:
+             res['Flip_Line'] = res['Put_Wall']
+
+        # 3. 判断 GEX 状态
+        if qqq_price < res['Flip_Line']:
+            res['GEX_Net'] = "🔴 Negative Gamma (高波动)"
+        else:
+            res['GEX_Net'] = "🟢 Positive Gamma (低波动)"
+            
+        # 4. Vanna
         if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
             res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
         else:
@@ -166,10 +189,8 @@ def get_derivatives_structure():
     except Exception as e: pass
     return res
 
-# [修改] 期权数据：缓存改为 1800秒
 @st.cache_data(ttl=1800)
 def get_qqq_options_data():
-    """PCR & Unusual Radar"""
     qqq = yf.Ticker("QQQ")
     res = {"PCR": 0.0, "Unusual": []}
     try:
@@ -192,7 +213,6 @@ def get_qqq_options_data():
     except: pass
     return res
 
-# 日历：保持 1小时
 @st.cache_data(ttl=3600)
 def get_macro_calendar():
     events = [
@@ -210,7 +230,6 @@ def get_macro_calendar():
         if 0 <= days <= 45: upcoming.append({**e, "Days": days})
     return sorted(upcoming, key=lambda x: x['Days'])
 
-# [修改] 新闻：缓存改为 1800秒 (30分钟)
 @st.cache_data(ttl=1800)
 def get_macro_news():
     feeds = [
@@ -227,7 +246,7 @@ def get_macro_news():
         except: pass
     return pd.DataFrame(articles)
 
-# --- 2. 核心算法: 多空评分模型 ---
+# --- 2. 核心算法 ---
 
 def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_score_val):
     score = 0
@@ -238,10 +257,8 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     spread = ny_fed['SOFR'] - ny_fed['TGCR']
     if spread > 0.05: liq_score -= 1.0; details.append("🔴 SOFR 异常")
     elif spread < 0.02: liq_score += 0.5
-    
     if fed_liq['RRP_Chg'] > 20: liq_score -= 0.5; details.append("🔴 RRP 抽水")
     if fed_liq['TGA_Chg'] > 20: liq_score -= 0.5; details.append("🔴 TGA 抽水")
-    
     if credit[1] < -0.5: liq_score -= 0.5
     elif credit[1] > 0.2: liq_score += 0.5
     score += max(-2.5, min(2.5, liq_score))
@@ -264,11 +281,11 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     trade_score = 0
     if opt['PCR'] > 1.1: trade_score -= 0.5; details.append("📉 PCR 偏空")
     elif opt['PCR'] < 0.7: trade_score += 0.5
+    if deriv['Basis_Status'].startswith("🔴"): trade_score -= 1.0; details.append("🔴 期货贴水")
     
-    if deriv['Basis_Status'].startswith("🔴"): 
-        trade_score -= 1.0; details.append("🔴 期货贴水")
+    # Flip Line 判定
     if deriv['GEX_Net'].startswith("🔴"):
-        trade_score -= 0.5; details.append("🔴 负 Gamma")
+        trade_score -= 0.5; details.append("🔴 跌破 Gamma Flip (负Gamma)")
     elif deriv['GEX_Net'].startswith("🟢"):
         trade_score += 0.5
         
@@ -281,9 +298,9 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     
     return round(score * (10 / 7.5), 1), details
 
-# --- 3. 界面渲染 (UI) ---
+# --- 3. UI ---
 
-with st.spinner("正在同步全球市场数据 (30分钟刷新)..."):
+with st.spinner("正在计算 Gamma Flip Line 及同步数据 (30分钟刷新)..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
     fed_liq = get_fed_liquidity()
@@ -335,7 +352,7 @@ with col_text:
 
 st.divider()
 
-# --- 模块 1: 流动性 ---
+# 1. 流动性
 st.subheader("1. 流动性监控 (Liquidity)")
 l1, l2, l3, l4, l5 = st.columns(5)
 l1.metric("SOFR", f"{ny_fed['SOFR']:.2f}%", f"Spread: {ny_fed['SOFR'] - ny_fed['TGCR']:.3f}")
@@ -346,7 +363,7 @@ l5.metric("HYG/LQD", f"{credit[0]:.3f}", f"{credit[1]:.2f}%")
 
 st.divider()
 
-# --- 模块 2: 美债与汇率 ---
+# 2. 美债
 st.subheader("2. 美债与汇率 (Rates & FX)")
 r1, r2, r3, r4, r5 = st.columns(5)
 r1.metric("10Y 美债收益率", f"{rates['Yield_10Y']:.2f}%")
@@ -357,8 +374,8 @@ r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# --- 模块 3: 交易与微观结构 ---
-st.subheader("3. 交易与微观结构 (Options & GEX)")
+# 3. 交易与微观结构 (含 Flip Line)
+st.subheader("3. 交易与微观结构 (Gamma Flip & GEX)")
 t1, t2, t3, t4 = st.columns(4)
 
 t1.metric("QQQ 期权 PCR", f"{opt['PCR']}", "Put/Call Ratio")
@@ -367,9 +384,10 @@ t3.metric("币圈恐慌指数", f"{vol['Crypto_Val']}", f"{vol['Crypto_Text']}")
 t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'])
 
 g1, g2, g3 = st.columns(3)
-g1.metric("Net Gamma (GEX)", deriv['GEX_Net'], "正Gamma抑制波动，负Gamma放大波动")
-g2.metric("关键支撑 (Put Wall)", f"${deriv['Put_Wall']}", "最大 Put 持仓位")
-g3.metric("关键阻力 (Call Wall)", f"${deriv['Call_Wall']}", "最大 Call 持仓位")
+# 这里显示自算的 Flip Line
+g1.metric("Gamma Flip Line (自算)", f"${deriv['Flip_Line']:.2f}", deriv['GEX_Net'], delta_color="off")
+g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "最大空头Gamma聚集")
+g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "最大多头Gamma聚集")
 
 with st.expander("查看 QQQ 异动雷达与 Vanna/Charm 状态", expanded=True):
     c_ex1, c_ex2 = st.columns([2, 1])
@@ -384,7 +402,7 @@ with st.expander("查看 QQQ 异动雷达与 Vanna/Charm 状态", expanded=True)
 
 st.divider()
 
-# --- 模块 4: 宏观新闻 ---
+# 4. 新闻
 st.subheader("4. 宏观新闻情报 (AI Sentiment)")
 col_news_list, col_news_stat = st.columns([3, 1])
 with col_news_list:
@@ -401,7 +419,7 @@ with col_news_stat:
 
 st.divider()
 
-# --- 模块 5: 日历 ---
+# 5. 日历
 st.subheader("5. 宏观日历")
 if cal:
     cols = st.columns(len(cal) if len(cal)<5 else 5)
