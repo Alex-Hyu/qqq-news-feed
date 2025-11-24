@@ -23,22 +23,12 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- [侧边栏] 配置与刷新 ---
+# --- [侧边栏] 配置 ---
 with st.sidebar:
     st.header("⚙️ 设置")
-    
-    # [修改] 这里已经填入了你的 API Key，默认隐藏显示
-    av_api_key = st.text_input(
-        "AlphaVantage API Key", 
-        value="UMWB63OXOOCIZHXR", 
-        type="password", 
-        help="用于获取真实宏观日历数据"
-    )
-    
+    av_api_key = st.text_input("AlphaVantage API Key", value="UMWB63OXOOCIZHXR", type="password")
     st.divider()
-    
     st.subheader("系统状态")
-    # 30分钟自动刷新
     count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
     st.caption(f"🟢 自动刷新: 开启 (30分钟)")
     if st.button("🔄 立即刷新"):
@@ -122,16 +112,18 @@ def get_volatility_indices():
         data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-# GEX/Flip Line
+# --- [修复] Gamma Flip / Wall 聚合算法 ---
 @st.cache_data(ttl=1800)
 def get_derivatives_structure():
     res = {
         "Futures_Basis": 0, "Basis_Status": "Normal", 
         "GEX_Net": "Neutral", "Call_Wall": 0, "Put_Wall": 0, 
         "Flip_Line": 0, "Current_Price": 0,
-        "Vanna_Charm_Proxy": "Neutral"
+        "Vanna_Charm_Proxy": "Neutral",
+        "Data_Note": ""
     }
     try:
+        # 1. 基础价格
         market_data = yf.download(["NQ=F", "^NDX", "QQQ"], period="2d", progress=False)['Close']
         if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.droplevel(0)
         
@@ -146,142 +138,157 @@ def get_derivatives_structure():
         elif basis > 50: res['Basis_Status'] = "🟢 Contango"
         else: res['Basis_Status'] = "⚪ Flat"
         
+        # 2. [核心修复] 聚合多期权链计算 Wall
         qqq = yf.Ticker("QQQ")
-        exp = qqq.options[0]
-        chain = qqq.option_chain(exp)
-        calls = chain.calls
-        puts = chain.puts
+        # 获取最近的 4 个到期日 (覆盖周权和月权)
+        expirations = qqq.options[:4] 
         
-        res['Call_Wall'] = calls.loc[calls['openInterest'].idxmax()]['strike']
-        res['Put_Wall'] = puts.loc[puts['openInterest'].idxmax()]['strike']
+        all_calls = []
+        all_puts = []
         
-        calls['G_Contribution'] = calls['openInterest']
-        puts['G_Contribution'] = puts['openInterest'] * -1
-        merged = pd.concat([calls[['strike', 'G_Contribution']], puts[['strike', 'G_Contribution']]])
-        gamma_profile = merged.groupby('strike').sum().sort_index()
+        for date in expirations:
+            try:
+                chain = qqq.option_chain(date)
+                # 必须清洗数据: 填充 NaN 为 0
+                c = chain.calls.fillna(0)
+                p = chain.puts.fillna(0)
+                all_calls.append(c[['strike', 'openInterest', 'volume']])
+                all_puts.append(p[['strike', 'openInterest', 'volume']])
+            except:
+                continue
         
-        flip_strike = 0
-        for index, row in gamma_profile.iterrows():
-            if row['G_Contribution'] < 0:
-                flip_strike = index
-                break
-        
-        if flip_strike == 0: res['Flip_Line'] = res['Put_Wall']
-        else: res['Flip_Line'] = (res['Put_Wall'] + flip_strike) / 2
-        
-        if abs(res['Flip_Line'] - qqq_price) > 50: res['Flip_Line'] = res['Put_Wall']
-        if qqq_price < res['Flip_Line']: res['GEX_Net'] = "🔴 Negative Gamma"
-        else: res['GEX_Net'] = "🟢 Positive Gamma"
+        if all_calls and all_puts:
+            # 合并数据
+            df_calls = pd.concat(all_calls)
+            df_puts = pd.concat(all_puts)
             
+            # 按 Strike 聚合求和 OI
+            total_calls = df_calls.groupby('strike')['openInterest'].sum()
+            total_puts = df_puts.groupby('strike')['openInterest'].sum()
+            
+            # 找到聚合后的最大持仓位
+            res['Call_Wall'] = total_calls.idxmax()
+            res['Put_Wall'] = total_puts.idxmax()
+            
+            # 3. 计算 Flip Line
+            # 算法: Call OI - Put OI 的差值 (Net Gamma Proxy)
+            # 对齐索引
+            combined = pd.DataFrame({'Call_OI': total_calls, 'Put_OI': total_puts}).fillna(0)
+            combined['Net_OI'] = combined['Call_OI'] - combined['Put_OI']
+            
+            # 寻找符号翻转点 (从正变负的地方)
+            # 或者寻找 Net OI 最接近 0 的点 (在 Put Wall 和 Call Wall 之间)
+            # 简单算法: 寻找 Put OI 开始超过 Call OI 的关键点
+            flip_candidates = combined[combined['Net_OI'] < 0]
+            if not flip_candidates.empty:
+                # 找最接近现价的翻转点
+                flip_strike = flip_candidates.index[0] # 简易取第一个
+                # 优化: 在现价附近找
+                near_price = flip_candidates.index[abs(flip_candidates.index - qqq_price).argmin()]
+                res['Flip_Line'] = near_price
+            else:
+                res['Flip_Line'] = res['Put_Wall'] # 兜底
+                
+            # GEX 状态判定
+            if qqq_price < res['Flip_Line']: res['GEX_Net'] = "🔴 Negative (高波)"
+            else: res['GEX_Net'] = "🟢 Positive (低波)"
+            
+            res['Data_Note'] = f"聚合了 {len(expirations)} 个到期日"
+            
+        # Vanna
         if market_data['^NDX'].iloc[-1] > market_data['^NDX'].iloc[-2]:
             res['Vanna_Charm_Proxy'] = "Tailwind (助涨)"
         else: res['Vanna_Charm_Proxy'] = "Headwind (阻力)"
-    except Exception as e: pass
+
+    except Exception as e: 
+        res['Data_Note'] = "数据获取失败"
+        print(e)
     return res
 
+# --- [修复] PCR 计算也改为聚合模式 ---
 @st.cache_data(ttl=1800)
 def get_qqq_options_data():
     qqq = yf.Ticker("QQQ")
     res = {"PCR": 0.0, "Unusual": []}
     try:
-        exp = qqq.options[0]
-        chain = qqq.option_chain(exp)
-        calls, puts = chain.calls, chain.puts
-        if calls['volume'].sum() > 0: 
-            res['PCR'] = round(puts['volume'].sum() / calls['volume'].sum(), 2)
+        # 同样聚合前 4 个到期日，样本量更大更准
+        expirations = qqq.options[:4]
         
+        total_c_vol = 0
+        total_p_vol = 0
         unusual = []
-        for opt_type, df, icon in [("CALL", calls, "🟢"), ("PUT", puts, "🔴")]:
-            hot = df[(df['volume'] > 500) & (df['volume'] > df['openInterest'] * 1.2)]
-            for _, row in hot.iterrows():
-                unusual.append({
-                    "Type": f"{icon} {opt_type}", "Strike": row['strike'],
-                    "Vol": int(row['volume']), "OI": int(row['openInterest']),
-                    "Ratio": round(row['volume'] / (row['openInterest']+1), 1)
-                })
-        res['Unusual'] = sorted(unusual, key=lambda x: x['Vol'], reverse=True)[:10]
+        
+        for date in expirations:
+            try:
+                chain = qqq.option_chain(date)
+                calls = chain.calls.fillna(0)
+                puts = chain.puts.fillna(0)
+                
+                total_c_vol += calls['volume'].sum()
+                total_p_vol += puts['volume'].sum()
+                
+                # 异动扫描 (只保留真正的大单)
+                for opt_type, df, icon in [("CALL", calls, "🟢"), ("PUT", puts, "🔴")]:
+                    # 提高阈值: 成交量 > 1000
+                    hot = df[(df['volume'] > 1000) & (df['volume'] > df['openInterest'] * 1.5)]
+                    for _, row in hot.iterrows():
+                        unusual.append({
+                            "Type": f"{icon} {opt_type}", 
+                            "Strike": row['strike'],
+                            "Exp": date, # 加上日期
+                            "Vol": int(row['volume']), 
+                            "OI": int(row['openInterest']),
+                            "Ratio": round(row['volume'] / (row['openInterest']+1), 1)
+                        })
+            except: continue
+            
+        if total_c_vol > 0: 
+            res['PCR'] = round(total_p_vol / total_c_vol, 2)
+            
+        # 按成交量排序取前 15
+        res['Unusual'] = sorted(unusual, key=lambda x: x['Vol'], reverse=True)[:15]
     except: pass
     return res
 
-# --- 双重保障的宏观日历 ---
+# 日历 (Alpha Vantage)
 @st.cache_data(ttl=3600)
 def get_macro_calendar(api_key=""):
-    """
-    优先使用 Alpha Vantage API (Key已内置)
-    失败则使用算法估算
-    """
-    # 方案 A: API 模式
     if api_key:
         try:
             url = f"https://www.alphavantage.co/query?function=ECONOMIC_CALENDAR&apikey={api_key}"
             r = requests.get(url, timeout=5)
             df = pd.read_csv(StringIO(r.text))
-            
-            # 过滤美元数据
             df = df[df['currency'] == 'USD']
-            
-            # 智能筛选关键词
-            keywords = ["GDP", "Unemployment", "CPI", "Interest Rate", "Payroll", "FOMC", "PCE", "Inventories"]
+            keywords = ["GDP", "Unemployment", "CPI", "Interest Rate", "Payroll", "FOMC", "PCE"]
             df['is_important'] = df['event'].apply(lambda x: any(k in x for k in keywords))
             df = df[df['is_important']]
-            
-            # 只要未来的
             today = datetime.date.today().strftime("%Y-%m-%d")
             df = df[df['date'] >= today].sort_values('date').head(10)
-            
             display_df = df[['date', 'time', 'event', 'estimate', 'previous']].copy()
             display_df.columns = ['Date', 'Time', 'Event', 'Est', 'Prev']
-            
-            # 如果没数据 (比如周末或假期)，可能返回空，这时触发方案 B
-            if not display_df.empty:
-                return display_df, "API Data (AlphaVantage)"
-            
-        except Exception as e:
-            pass # 失败则静默进入方案 B
+            if not display_df.empty: return display_df, "API Data"
+        except: pass
 
-    # 方案 B: 算法估算兜底
+    # 备用
     today = datetime.date.today()
     events = []
-    
-    # 估算 CPI (每月12号左右)
     next_month = today.replace(day=28) + datetime.timedelta(days=4)
     next_cpi = today.replace(day=12) 
     if today.day > 12: next_cpi = (next_month - datetime.timedelta(days=1)).replace(day=12)
-    events.append({"Date": next_cpi, "Event": "CPI 通胀数据 (估算)", "Type": "Inflation"})
-    
-    # 估算 非农 (每月5号左右)
-    next_nfp = today.replace(day=5)
-    if today.day > 5: next_nfp = (next_month - datetime.timedelta(days=1)).replace(day=5)
-    events.append({"Date": next_nfp, "Event": "Nonfarm Payrolls (估算)", "Type": "Jobs"})
-    
-    # 估算 FOMC
-    known_fomc = ["2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-12-10"]
-    for d_str in known_fomc:
-        d = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
-        if d >= today:
-            events.append({"Date": d, "Event": "FOMC 利率决议 (预设)", "Type": "Fed"})
-            break 
-            
-    events.append({"Date": datetime.date(today.year, 6, 15), "Event": "Q2 缴税日 (流动性抽水)", "Type": "Liquidity"})
+    events.append({"Date": next_cpi, "Event": "CPI (Est)", "Type": "Inflation"})
     
     events = sorted(events, key=lambda x: x['Date'])
     df = pd.DataFrame(events)
     df = df[df['Date'] >= today].head(5)
-    
-    display_df = df.copy()
-    display_df['Time'] = "N/A"
-    display_df['Est'] = "--"
-    display_df['Prev'] = "--"
-    display_df = display_df[['Date', 'Time', 'Event', 'Est', 'Prev']]
-    
-    return display_df, "备用数据 (Estimated)"
+    d_df = df.copy()
+    d_df['Time']="--"; d_df['Est']="--"; d_df['Prev']="--"
+    return d_df[['Date','Time','Event','Est','Prev']], "Estimated"
 
 @st.cache_data(ttl=1800)
 def get_macro_news():
     feeds = [
         ("CNBC Economy", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
-        ("MarketWatch", "http://feeds.marketwatch.com/marketwatch/topstories/"),
-        ("WSJ Markets", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml")
+        ("MarketWatch", "http://feeds.marketwatch.com/marketwatch/topstories/")
     ]
     articles = []
     for src, url in feeds:
@@ -298,7 +305,7 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     score = 0
     details = []
     
-    # 1. 流动性 (25%)
+    # 流动性 (25%)
     liq_score = 0
     spread = ny_fed['SOFR'] - ny_fed['TGCR']
     if spread > 0.05: liq_score -= 1.0; details.append("🔴 SOFR 异常")
@@ -306,24 +313,23 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     if fed_liq['RRP_Chg'] > 20: liq_score -= 0.5; details.append("🔴 RRP 抽水")
     if fed_liq['TGA_Chg'] > 20: liq_score -= 0.5; details.append("🔴 TGA 抽水")
     if credit[1] < -0.5: liq_score -= 0.5
-    elif credit[1] > 0.2: liq_score += 0.5
     score += max(-2.5, min(2.5, liq_score))
     
-    # 2. 美债 (25%)
+    # 美债 (25%)
     bond_score = 0
     if rates['Yield_10Y'] > 4.5: bond_score -= 1.0
     elif rates['Yield_10Y'] < 4.0: bond_score += 1.0
     if rates['MOVE'] > 110: bond_score -= 1.5
     score += max(-2.5, min(2.5, bond_score))
     
-    # 3. 恐慌 (15%)
+    # 恐慌 (15%)
     fear_score = 0
     if vol['VIX'] > 25: fear_score -= 1.0
     elif vol['VIX'] < 13: fear_score -= 0.5
     if vol['Crypto_Val'] < 20: fear_score += 0.5
     score += fear_score
     
-    # 4. 交易与微观结构 (20%)
+    # 交易 (20%)
     trade_score = 0
     if opt['PCR'] > 1.1: trade_score -= 0.5; details.append("📉 PCR 偏空")
     elif opt['PCR'] < 0.7: trade_score += 0.5
@@ -332,25 +338,24 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     elif deriv['GEX_Net'].startswith("🟢"): trade_score += 0.5
     score += max(-2.0, min(2.0, trade_score))
     
-    # 5. 新闻 (15%)
-    news_con = news_score_val * 1.5
-    score += news_con
-    if news_con < -0.5: details.append("🔴 舆情偏空")
+    # 新闻 (15%)
+    score += news_score_val * 1.5
     
     return round(score * (10 / 7.5), 1), details
 
 # --- 3. UI ---
 
-with st.spinner("正在同步全球市场数据 (30分钟刷新)..."):
+with st.spinner("正在聚合多期权链数据 (30分钟刷新)..."):
     ai_model = load_ai_model()
     ny_fed = get_ny_fed_data()
     fed_liq = get_fed_liquidity()
     credit = get_credit_spreads()
     rates = get_rates_and_fx()
     vol = get_volatility_indices()
+    # 核心数据源
     opt = get_qqq_options_data()
     deriv = get_derivatives_structure()
-    # 传入 API Key
+    
     cal_df, cal_source = get_macro_calendar(av_api_key)
     raw_news = get_macro_news()
 
@@ -416,19 +421,20 @@ r5.metric("美元/日元", f"{rates['USDJPY']:.2f}")
 
 st.divider()
 
-# 3. 交易与微观结构
-st.subheader("3. 交易与微观结构 (Gamma Flip & GEX)")
-t1, t2, t3, t4 = st.columns(4)
+# 3. 交易与微观结构 (聚合版)
+st.subheader("3. 交易与微观结构 (Aggregated Options & GEX)")
+st.caption(f"数据说明: 已聚合未来 4 个到期日 (包含月权) 的 OI 数据，解决 0DTE 数据缺失问题。")
 
+t1, t2, t3, t4 = st.columns(4)
 t1.metric("QQQ 期权 PCR", f"{opt['PCR']}", "Put/Call Ratio")
 t2.metric("VIX 股市恐慌", f"{vol['VIX']:.2f}")
 t3.metric("币圈恐慌指数", f"{vol['Crypto_Val']}", f"{vol['Crypto_Text']}")
 t4.metric("期货基差 (Basis)", f"{deriv['Futures_Basis']:.2f}", deriv['Basis_Status'])
 
 g1, g2, g3 = st.columns(3)
-g1.metric("Gamma Flip Line (自算)", f"${deriv['Flip_Line']:.2f}", deriv['GEX_Net'], delta_color="off")
-g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "最大空头Gamma")
-g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "最大多头Gamma")
+g1.metric("Gamma Flip Line (聚合自算)", f"${deriv['Flip_Line']:.2f}", deriv['GEX_Net'], delta_color="off")
+g2.metric("Put Wall (强支撑)", f"${deriv['Put_Wall']}", "Total OI Max")
+g3.metric("Call Wall (强阻力)", f"${deriv['Call_Wall']}", "Total OI Max")
 
 with st.expander("📚 交易员参考手册：如何解读 PCR (OI)？", expanded=False):
     st.markdown("""
@@ -443,8 +449,13 @@ with st.expander("📚 交易员参考手册：如何解读 PCR (OI)？", expand
 with st.expander("查看 QQQ 异动雷达与 Vanna/Charm 状态", expanded=True):
     c_ex1, c_ex2 = st.columns([2, 1])
     with c_ex1:
-        st.write("**⚡ 异动雷达 (Unusual Volume > OI)**")
-        if opt['Unusual']: st.dataframe(pd.DataFrame(opt['Unusual']), use_container_width=True)
+        st.write("**⚡ 异动雷达 (Aggregated Volume > 1000)**")
+        if opt['Unusual']: 
+            st.dataframe(
+                pd.DataFrame(opt['Unusual']), 
+                column_config={"Exp": "到期日"},
+                use_container_width=True
+            )
         else: st.info("今日无显著异动。")
     with c_ex2:
         st.write("**Greek Flows (Proxy)**")
@@ -475,14 +486,7 @@ st.subheader(f"5. 宏观日历 ({cal_source})")
 c1, c2 = st.columns([3, 1])
 with c1:
     if not cal_df.empty:
-        st.dataframe(
-            cal_df,
-            column_config={
-                "Date": "日期", "Time": "时间", "Event": "事件",
-                "Est": "预期", "Prev": "前值"
-            },
-            hide_index=True, use_container_width=True
-        )
+        st.dataframe(cal_df, hide_index=True, use_container_width=True)
     else: st.write("近期无重要数据。")
 
 with c2:
@@ -491,96 +495,4 @@ with c2:
     - 🦅 **鹰派**: Waller
     - 🕊️ **鸽派**: Goolsbee
     - ⚖️ **中性**: Powell
-    """)
-    # ... (上面所有原有代码保持不变) ...
-
-# --- [新增] 模块 6: 日内战术面板 (Intraday Tactical) ---
-st.subheader("6. 日内交易战术面板 (0DTE & Micro Structure)")
-
-@st.cache_data(ttl=60) # 1分钟刷新，日内要求高时效
-def get_intraday_tactics():
-    res = {
-        "VWAP": 0, "Price": 0, "Trend": "Neutral",
-        "Exp_Move": 0, "Upper_Band": 0, "Lower_Band": 0,
-        "0DTE_Call_Vol": 0, "0DTE_Put_Vol": 0, "0DTE_Sentiment": "Neutral"
-    }
-    try:
-        # 1. 获取 QQQ 日内 1分钟 数据计算 VWAP
-        # 注意: yfinance 免费版日内数据可能延迟，实盘请以此为参考趋势
-        df = yf.download("QQQ", period="1d", interval="5m", progress=False)
-        if not df.empty:
-            # 计算 VWAP = Cumulative(Price * Vol) / Cumulative(Vol)
-            df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
-            df['PV'] = df['TP'] * df['Volume']
-            vwap = df['PV'].sum() / df['Volume'].sum()
-            
-            current_price = df['Close'].iloc[-1]
-            res['VWAP'] = vwap
-            res['Price'] = current_price
-            
-            if current_price > vwap * 1.001: res['Trend'] = "🟢 多头控盘 (Above VWAP)"
-            elif current_price < vwap * 0.999: res['Trend'] = "🔴 空头控盘 (Below VWAP)"
-            else: res['Trend'] = "⚪ 震荡 (At VWAP)"
-            
-        # 2. 计算今日预期波动 (Expected Move)
-        # 简化公式: 0DTE ATM Straddle Price (Call + Put)
-        # 这里用 VIX 倒推: Exp Move = Price * (VIX/16) * sqrt(1/252)
-        # VIX/16 近似日波动率
-        vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
-        daily_vol = (vix / 100) / np.sqrt(252)
-        exp_move = res['Price'] * daily_vol
-        
-        res['Exp_Move'] = exp_move
-        res['Upper_Band'] = res['Price'] + exp_move
-        res['Lower_Band'] = res['Price'] - exp_move
-        
-        # 3. 0DTE 情绪 (近似)
-        qqq = yf.Ticker("QQQ")
-        # 找最近的过期日
-        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        dates = qqq.options
-        target_date = dates[0] # 最近的一期，可能是今天或明天
-        
-        chain = qqq.option_chain(target_date)
-        c_vol = chain.calls['volume'].sum()
-        p_vol = chain.puts['volume'].sum()
-        
-        res['0DTE_Call_Vol'] = c_vol
-        res['0DTE_Put_Vol'] = p_vol
-        
-        if c_vol > p_vol: res['0DTE_Sentiment'] = "🟢 Call 主导 (追涨)"
-        else: res['0DTE_Sentiment'] = "🔴 Put 主导 (杀跌/避险)"
-        
-        res['Expiry_Date'] = target_date
-
-    except Exception as e: pass
-    return res
-
-# UI 渲染
-with st.spinner("正在计算日内 VWAP 与 0DTE 数据..."):
-    tactics = get_intraday_tactics()
-
-c_day1, c_day2, c_day3, c_day4 = st.columns(4)
-
-# 1. VWAP 趋势
-c_day1.metric("日内趋势 (VWAP)", f"${tactics['VWAP']:.2f}", tactics['Trend'], delta_color="off")
-
-# 2. 预期波动
-c_day2.metric("今日预期波动", f"±${tactics['Exp_Move']:.2f}", f"VIX推算")
-
-# 3. 0DTE 情绪
-c_day3.metric(f"短期期权 ({tactics.get('Expiry_Date','')})", tactics['0DTE_Sentiment'], f"C/P Vol: {int(tactics['0DTE_Call_Vol']/1000)}k / {int(tactics['0DTE_Put_Vol']/1000)}k")
-
-# 4. 交易区间
-c_day4.metric("今日安全边界", f"${tactics['Lower_Band']:.2f} - ${tactics['Upper_Band']:.2f}", "超跌/超买区域")
-
-# 交易建议展示
-with st.expander("🏹 日内期权狙击指南 (Intraday Cheat Sheet)", expanded=True):
-    st.markdown(f"""
-    *   **当前价格**: `${tactics['Price']:.2f}` vs **VWAP**: `${tactics['VWAP']:.2f}`
-    *   **策略**:
-        *   若价格 > VWAP 且 Gamma Positive (🟢): **逢低做多 (Buy Calls on Dips)**.
-        *   若价格 < VWAP 且 Gamma Negative (🔴): **逢高做空 (Buy Puts on Rallies)**.
-        *   若价格触及 `${tactics['Upper_Band']:.2f}` (上轨): 考虑 **反向做空/止盈 (Fade the move)**.
-        *   若价格触及 `${tactics['Lower_Band']:.2f}` (下轨): 考虑 **反向做多/止盈 (Buy the dip)**.
     """)
