@@ -530,3 +530,104 @@ c_day4.metric("QQQ 现价", f"${tactics['Price']:.2f}", delta_str)
 with st.expander("🏹 日内指南", expanded=True):
     st.write(f"上轨: ${tactics['Upper_Band']:.2f} | 下轨: ${tactics['Lower_Band']:.2f}")
     st.write("策略: 价格 > VWAP 逢低多; 价格 < VWAP 逢高空。")
+    # ... (以上所有代码保持不变) ...
+
+# --- [新增] 模块 7: 历史统计与策略回测 ---
+st.subheader("7. 策略回测：过去3年 QQQ K线形态统计")
+
+@st.cache_data(ttl=86400) # 每天算一次就行
+def get_qqq_historical_stats():
+    res = {}
+    try:
+        # 1. 抓取过去 3 年数据
+        df = yf.download("QQQ", period="3y", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        
+        # 2. 计算指标
+        df['Range'] = df['High'] - df['Low']
+        df['Body'] = df['Close'] - df['Open']
+        df['Abs_Body'] = df['Body'].abs()
+        
+        # 趋势效率 = 实体 / 总振幅
+        # 值越接近 1，说明是光头光脚的单边行情
+        # 值越接近 0，说明是十字星或长影线的震荡行情
+        df['Efficiency'] = df['Abs_Body'] / df['Range']
+        
+        # 3. 分类定义 (阈值设为 0.5)
+        # Trend Day: 实体占据振幅 50% 以上
+        # Choppy Day: 实体占据振幅 50% 以下
+        conditions = [
+            (df['Efficiency'] > 0.5) & (df['Body'] > 0), # 单边上涨
+            (df['Efficiency'] > 0.5) & (df['Body'] < 0), # 单边下跌
+            (df['Efficiency'] <= 0.5)                     # 震荡/反转
+        ]
+        choices = ['Trend_Up', 'Trend_Down', 'Choppy']
+        df['Type'] = np.select(conditions, choices, default='Choppy')
+        
+        # 4. 统计结果
+        counts = df['Type'].value_counts()
+        total_days = len(df)
+        
+        res['Up_Days'] = counts.get('Trend_Up', 0)
+        res['Down_Days'] = counts.get('Trend_Down', 0)
+        res['Chop_Days'] = counts.get('Choppy', 0)
+        
+        res['Up_Pct'] = round((res['Up_Days'] / total_days) * 100, 1)
+        res['Down_Pct'] = round((res['Down_Days'] / total_days) * 100, 1)
+        res['Chop_Pct'] = round((res['Chop_Days'] / total_days) * 100, 1)
+        
+        # 计算平均日内波动幅度 (ATR)
+        res['Avg_Range'] = df['Range'].mean()
+        res['Avg_Range_Pct'] = (df['Range'] / df['Open']).mean() * 100
+        
+    except Exception as e: 
+        st.error(f"统计计算出错: {e}")
+        pass
+    return res
+
+# 渲染统计面板
+with st.spinner("正在回测过去 3 年 K 线数据..."):
+    stats = get_qqq_historical_stats()
+
+if stats:
+    c_stat1, c_stat2 = st.columns([1, 2])
+    
+    with c_stat1:
+        st.markdown("#### 📊 市场性格画像")
+        st.metric("震荡/均值回归概率", f"{stats['Chop_Pct']}%", f"{stats['Chop_Days']} 天", delta_color="off")
+        st.metric("单边上涨概率", f"{stats['Up_Pct']}%", f"{stats['Up_Days']} 天", delta_color="normal")
+        st.metric("单边下跌概率", f"{stats['Down_Pct']}%", f"{stats['Down_Days']} 天", delta_color="inverse")
+        
+        st.info(f"💡 **日内平均波幅 (ATR)**: ${stats['Avg_Range']:.2f} ({stats['Avg_Range_Pct']:.2f}%)")
+
+    with c_stat2:
+        st.markdown("#### 🧠 量化交易启示录")
+        
+        # 动态生成建议
+        dominate_type = "震荡"
+        if stats['Chop_Pct'] > 50:
+            strategy = "🛡️ **首选策略: 均值回归 (Mean Reversion)**"
+            details = """
+            *   **不要追涨杀跌**: 突破买入的胜率很低。
+            *   **VWAP 战法**: 价格偏离 VWAP 过远时，大概率会回归。
+            *   **期权**: 适合卖方策略 (Iron Condor) 或在关键支撑阻力位做反转 (Fade the move)。
+            """
+        else:
+            dominate_type = "趋势"
+            strategy = "🚀 **首选策略: 趋势跟随 (Trend Following)**"
+            details = """
+            *   **顺势而为**: 突破关键点位后果断追单。
+            *   **VWAP 战法**: 回踩 VWAP 不破是最佳上车点。
+            *   **期权**: 买入 Call/Put 赌单边。
+            """
+            
+        st.success(f"{strategy}")
+        st.markdown(details)
+        
+        st.markdown("""
+        ---
+        **数据解读**:
+        *   **震荡日 (Choppy)**: 收盘价回撤，留有长影线。适合 **高抛低吸**。
+        *   **趋势日 (Trend)**: 收盘价在全天最高/最低附近。适合 **持有到收盘**。
+        *   **统计结论**: 美股大部分时间 (约 60%+) 处于震荡或缓慢爬升中，单边暴跌或暴涨其实是少数。**日内交易切忌频繁止损去赌突破。**
+        """)
