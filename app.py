@@ -54,12 +54,59 @@ st.markdown("""
 with st.sidebar:
     st.header("⚙️ 设置")
     av_api_key = st.text_input("AlphaVantage API Key", value="UMWB63OXOOCIZHXR", type="password")
+    
     st.divider()
-    st.subheader("系统状态")
-    count = st_autorefresh(interval=30 * 60 * 1000, key="data_refresher")
-    st.caption(f"🟢 自动刷新: 开启 (30分钟)")
-    if st.button("🔄 立即刷新"):
+    st.subheader("🔄 刷新控制")
+    
+    # 全局刷新 (所有数据)
+    if st.button("🔄 全局刷新 (所有数据)", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
+    
+    st.caption("⚠️ 全局刷新较慢，建议仅在开盘前使用")
+    
+    st.divider()
+    
+    # 分类刷新
+    st.markdown("**按需刷新：**")
+    
+    col_ref1, col_ref2 = st.columns(2)
+    with col_ref1:
+        if st.button("📊 GEX/期权", use_container_width=True, help="刷新期权链和GEX计算"):
+            # 清除期权相关缓存
+            calculate_gex_profile.clear()
+            get_qqq_options_data.clear()
+            get_derivatives_structure.clear()
+            st.rerun()
+    
+    with col_ref2:
+        if st.button("📈 日内数据", use_container_width=True, help="刷新VWAP和盘中数据"):
+            get_intraday_tactics.clear()
+            st.rerun()
+    
+    col_ref3, col_ref4 = st.columns(2)
+    with col_ref3:
+        if st.button("📰 新闻", use_container_width=True, help="刷新新闻和情绪分析"):
+            get_multi_source_news.clear()
+            st.rerun()
+    
+    with col_ref4:
+        if st.button("💧 流动性", use_container_width=True, help="刷新SOFR/RRP/TGA"):
+            get_sofr_repo_history.clear()
+            get_rrp_tga_history.clear()
+            get_ny_fed_data.clear()
+            get_fed_liquidity.clear()
+            st.rerun()
+    
+    st.divider()
+    st.subheader("📋 缓存策略")
+    st.caption("""
+    • 流动性/宏观: 4小时  
+    • 美债/汇率: 2小时  
+    • 新闻: 2小时  
+    • 期权/GEX: 1小时  
+    • 日内VWAP: 5分钟
+    """)
 
 # ============================================================
 # 1. 核心数据获取函数
@@ -70,7 +117,7 @@ def load_ai_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 # --- SOFR/Repo 历史数据 (30天) ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=14400)  # 4小时缓存 (宏观数据变化慢)
 def get_sofr_repo_history():
     """获取 SOFR 和 Repo 利率的30天历史数据"""
     result = {
@@ -125,7 +172,7 @@ def get_sofr_repo_history():
     return result
 
 # --- RRP/TGA 历史数据 (30天) ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=14400)  # 4小时缓存 (每天更新一次的数据)
 def get_rrp_tga_history():
     """获取 RRP 和 TGA 的30天历史数据"""
     result = {
@@ -201,7 +248,7 @@ def get_rrp_tga_history():
     
     return result
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=14400)  # 4小时缓存
 def get_ny_fed_data():
     try:
         url = "https://markets.newyorkfed.org/api/rates/all/latest.json"
@@ -213,7 +260,7 @@ def get_ny_fed_data():
         return rates
     except: return {'SOFR': 5.33, 'TGCR': 5.32}
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=14400)  # 4小时缓存
 def get_fed_liquidity():
     res = {"RRP": 0, "RRP_Chg": 0, "TGA": 0, "TGA_Chg": 0}
     try:
@@ -226,7 +273,7 @@ def get_fed_liquidity():
     except: pass
     return res
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=7200)  # 2小时缓存
 def get_credit_spreads():
     try:
         data = yf.download(["HYG", "LQD"], period="5d", progress=False)['Close']
@@ -237,7 +284,7 @@ def get_credit_spreads():
         return curr, pct
     except: return 0, 0
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=7200)  # 2小时缓存
 def get_rates_and_fx():
     tickers = ["^IRX", "^TNX", "DX-Y.NYB", "JPY=X", "^MOVE"] 
     res = {'Yield_Short': 0, 'Yield_10Y': 0, 'Inversion': 0, 'DXY': 0, 'USDJPY': 0, 'MOVE': 0, 'USDJPY_Chg': 0}
@@ -284,7 +331,7 @@ def get_rates_and_fx():
         
     return res
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)  # 1小时缓存
 def get_volatility_indices():
     data = {}
     try:
@@ -298,7 +345,7 @@ def get_volatility_indices():
     except: data['Crypto_Val'] = 50; data['Crypto_Text'] = "Unknown"
     return data
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)  # 1小时缓存
 def get_derivatives_structure():
     res = {
         "Futures_Basis": 0, "Basis_Status": "Normal", 
@@ -356,7 +403,7 @@ def get_derivatives_structure():
     except: pass
     return res
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)  # 1小时缓存
 def get_qqq_options_data():
     qqq = yf.Ticker("QQQ")
     res = {"PCR": 0.0, "Unusual": []}
@@ -382,7 +429,7 @@ def get_qqq_options_data():
     except: pass
     return res
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)  # 5分钟缓存 (日内数据需要较新)
 def get_intraday_tactics():
     res = {
         "VWAP": 0, "Price": 0, "Trend": "Neutral",
@@ -494,7 +541,7 @@ def score_news_importance(title: str) -> int:
             score = max(score, weight)  # 取最高权重而非累加
     return score
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=7200)  # 2小时缓存 (新闻 + FinBERT 分析较慢)
 def get_multi_source_news():
     """从多个来源获取新闻"""
     feeds = [
@@ -670,12 +717,27 @@ def black_scholes_gamma(S, K, T, r, sigma):
     except:
         return 0
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)  # 1小时缓存 (可手动刷新获取最新)
 def calculate_gex_profile():
     """
     计算完整的 GEX Profile
     返回按 Strike 分布的 Gamma Exposure
     """
+    # 记录计算时间
+    calc_time = datetime.datetime.now(pytz.timezone('US/Eastern'))
+    
+    # 计算 OI 数据日期 (前一个交易日)
+    # 简化处理：如果是周一，OI 是周五的；否则是昨天的
+    today = datetime.date.today()
+    if today.weekday() == 0:  # 周一
+        oi_date = today - timedelta(days=3)  # 周五
+    elif today.weekday() == 6:  # 周日
+        oi_date = today - timedelta(days=2)  # 周五
+    elif today.weekday() == 5:  # 周六
+        oi_date = today - timedelta(days=1)  # 周五
+    else:
+        oi_date = today - timedelta(days=1)  # 昨天
+    
     result = {
         'strikes': [],
         'gex_call': [],
@@ -686,7 +748,10 @@ def calculate_gex_profile():
         'max_pain': 0,
         'spot_price': 0,
         'put_wall': 0,
-        'call_wall': 0
+        'call_wall': 0,
+        'calc_time': calc_time.strftime('%Y-%m-%d %H:%M:%S EST'),
+        'oi_date': oi_date.strftime('%Y-%m-%d'),
+        'oi_weekday': ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][oi_date.weekday()]
     }
     
     try:
@@ -1463,6 +1528,15 @@ g3.metric("Put Wall", f"${deriv['Put_Wall']}")
 g4.metric("Call Wall", f"${deriv['Call_Wall']}")
 
 with st.expander("📊 Gamma Exposure (GEX) Profile", expanded=True):
+    # 显示数据时间戳
+    gex_time_col1, gex_time_col2, gex_time_col3 = st.columns(3)
+    with gex_time_col1:
+        st.caption(f"📅 OI 数据日期: **{gex_data.get('oi_date', 'N/A')}** ({gex_data.get('oi_weekday', '')})")
+    with gex_time_col2:
+        st.caption(f"⏰ 计算时间: **{gex_data.get('calc_time', 'N/A')}**")
+    with gex_time_col3:
+        st.caption("💡 OI 每天盘前更新，反映前一交易日收盘持仓")
+    
     if gex_data['strikes']:
         col_gex1, col_gex2 = st.columns([2, 1])
         
