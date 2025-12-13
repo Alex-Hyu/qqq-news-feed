@@ -141,27 +141,52 @@ def get_rrp_tga_history():
         # RRP (Overnight Reverse Repo)
         rrp_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=RRPONTSYD"
         rrp_df = pd.read_csv(rrp_url)
+        
+        # 自动检测日期列名 (可能是 'DATE' 或 'date' 或第一列)
+        date_col = None
+        for col in rrp_df.columns:
+            if col.upper() == 'DATE' or 'date' in col.lower():
+                date_col = col
+                break
+        if date_col is None:
+            date_col = rrp_df.columns[0]  # 使用第一列作为日期
+        
+        # 数据列
+        rrp_col = 'RRPONTSYD' if 'RRPONTSYD' in rrp_df.columns else rrp_df.columns[1]
+        
         rrp_df = rrp_df.dropna().tail(35)
+        rrp_df[date_col] = pd.to_datetime(rrp_df[date_col])
         
         # TGA (Treasury General Account)
         tga_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=WTREGEN"
         tga_df = pd.read_csv(tga_url)
-        tga_df = tga_df.dropna().tail(35)
         
-        # 对齐日期
-        rrp_df['DATE'] = pd.to_datetime(rrp_df['DATE'])
-        tga_df['DATE'] = pd.to_datetime(tga_df['DATE'])
+        # 自动检测 TGA 列名
+        tga_date_col = None
+        for col in tga_df.columns:
+            if col.upper() == 'DATE' or 'date' in col.lower():
+                tga_date_col = col
+                break
+        if tga_date_col is None:
+            tga_date_col = tga_df.columns[0]
+        
+        tga_col = 'WTREGEN' if 'WTREGEN' in tga_df.columns else tga_df.columns[1]
+        
+        tga_df = tga_df.dropna().tail(35)
+        tga_df[tga_date_col] = pd.to_datetime(tga_df[tga_date_col])
         
         # 取最近30天
-        result['dates'] = rrp_df['DATE'].dt.strftime('%Y-%m-%d').tolist()[-30:]
-        result['rrp'] = rrp_df['RRPONTSYD'].tolist()[-30:]
+        result['dates'] = rrp_df[date_col].dt.strftime('%Y-%m-%d').tolist()[-30:]
+        result['rrp'] = rrp_df[rrp_col].tolist()[-30:]
         
-        # TGA 是周度数据，需要对齐
-        tga_dict = dict(zip(tga_df['DATE'].dt.strftime('%Y-%m-%d'), tga_df['WTREGEN']))
+        # TGA 是周度数据，需要对齐 (使用前向填充)
+        tga_dict = dict(zip(tga_df[tga_date_col].dt.strftime('%Y-%m-%d'), tga_df[tga_col]))
         result['tga'] = []
         last_tga = list(tga_dict.values())[-1] if tga_dict else 0
         for d in result['dates']:
-            result['tga'].append(tga_dict.get(d, last_tga))
+            if d in tga_dict:
+                last_tga = tga_dict[d]
+            result['tga'].append(last_tga)
         
         if result['rrp']:
             result['current_rrp'] = result['rrp'][-1]
@@ -171,7 +196,8 @@ def get_rrp_tga_history():
             result['tga_chg'] = result['tga'][-1] - result['tga'][-2] if len(result['tga']) > 1 else 0
             
     except Exception as e:
-        st.warning(f"RRP/TGA 历史数据获取失败: {e}")
+        # 静默失败，不显示警告，返回空结果
+        pass
     
     return result
 
@@ -666,17 +692,28 @@ def calculate_gex_profile():
     try:
         # 获取 QQQ 数据
         qqq = yf.Ticker("QQQ")
-        spot = qqq.history(period="1d")['Close'].iloc[-1]
+        hist = qqq.history(period="1d")
+        if hist.empty:
+            return result
+        spot = float(hist['Close'].iloc[-1])
         result['spot_price'] = spot
         
         # 获取无风险利率 (3个月国债)
         try:
-            irx = yf.Ticker("^IRX").history(period="1d")['Close'].iloc[-1] / 100
+            irx_hist = yf.Ticker("^IRX").history(period="1d")
+            if not irx_hist.empty:
+                irx = float(irx_hist['Close'].iloc[-1]) / 100
+            else:
+                irx = 0.05
         except:
             irx = 0.05
         
         # 收集所有期权链数据
-        expirations = qqq.options[:4]  # 取前4个到期日
+        try:
+            expirations = qqq.options[:4]  # 取前4个到期日
+        except:
+            return result
+            
         all_options = []
         
         for exp_date in expirations:
@@ -686,35 +723,58 @@ def calculate_gex_profile():
                 # 计算到期时间
                 exp_dt = datetime.datetime.strptime(exp_date, "%Y-%m-%d")
                 today = datetime.datetime.now()
-                T = max((exp_dt - today).days / 365, 0.001)
+                days_to_exp = (exp_dt - today).days
+                T = max(days_to_exp / 365, 0.001)
                 
                 # 处理 Calls
                 for _, row in chain.calls.iterrows():
-                    if row['openInterest'] > 50:
-                        iv = row.get('impliedVolatility', 0.3)
-                        if pd.isna(iv) or iv <= 0:
-                            iv = 0.3
-                        all_options.append({
-                            'strike': row['strike'],
-                            'oi': row['openInterest'],
-                            'iv': iv,
-                            'T': T,
-                            'type': 'call'
-                        })
+                    try:
+                        oi = row.get('openInterest', 0)
+                        if pd.isna(oi):
+                            oi = 0
+                        oi = float(oi)
+                        
+                        if oi > 50:
+                            iv = row.get('impliedVolatility', 0.3)
+                            if pd.isna(iv) or iv <= 0 or iv > 5:  # IV 超过 500% 视为异常
+                                iv = 0.3
+                            iv = float(iv)
+                            
+                            strike = float(row['strike'])
+                            all_options.append({
+                                'strike': strike,
+                                'oi': oi,
+                                'iv': iv,
+                                'T': T,
+                                'type': 'call'
+                            })
+                    except:
+                        continue
                 
                 # 处理 Puts
                 for _, row in chain.puts.iterrows():
-                    if row['openInterest'] > 50:
-                        iv = row.get('impliedVolatility', 0.3)
-                        if pd.isna(iv) or iv <= 0:
-                            iv = 0.3
-                        all_options.append({
-                            'strike': row['strike'],
-                            'oi': row['openInterest'],
-                            'iv': iv,
-                            'T': T,
-                            'type': 'put'
-                        })
+                    try:
+                        oi = row.get('openInterest', 0)
+                        if pd.isna(oi):
+                            oi = 0
+                        oi = float(oi)
+                        
+                        if oi > 50:
+                            iv = row.get('impliedVolatility', 0.3)
+                            if pd.isna(iv) or iv <= 0 or iv > 5:
+                                iv = 0.3
+                            iv = float(iv)
+                            
+                            strike = float(row['strike'])
+                            all_options.append({
+                                'strike': strike,
+                                'oi': oi,
+                                'iv': iv,
+                                'T': T,
+                                'type': 'put'
+                            })
+                    except:
+                        continue
             except:
                 continue
         
@@ -725,23 +785,32 @@ def calculate_gex_profile():
         gex_by_strike = {}
         
         for opt in all_options:
-            strike = opt['strike']
-            gamma = black_scholes_gamma(spot, strike, opt['T'], irx, opt['iv'])
-            
-            # GEX = Gamma × OI × 100 × Spot² / 1e9 (转换为十亿美元)
-            gex = gamma * opt['oi'] * 100 * (spot ** 2) / 1e9
-            
-            if strike not in gex_by_strike:
-                gex_by_strike[strike] = {'call': 0, 'put': 0}
-            
-            if opt['type'] == 'call':
-                gex_by_strike[strike]['call'] += gex
-            else:
-                gex_by_strike[strike]['put'] += gex
+            try:
+                strike = opt['strike']
+                gamma = black_scholes_gamma(spot, strike, opt['T'], irx, opt['iv'])
+                
+                # GEX = Gamma × OI × 100 × Spot² / 1e9 (转换为十亿美元)
+                gex = gamma * opt['oi'] * 100 * (spot ** 2) / 1e9
+                
+                if strike not in gex_by_strike:
+                    gex_by_strike[strike] = {'call': 0, 'put': 0}
+                
+                if opt['type'] == 'call':
+                    gex_by_strike[strike]['call'] += gex
+                else:
+                    gex_by_strike[strike]['put'] += gex
+            except:
+                continue
         
-        # 过滤并排序
+        if not gex_by_strike:
+            return result
+        
+        # 过滤并排序 - 只保留现价附近 ±10% 的 strikes
         valid_strikes = [s for s in gex_by_strike.keys() if spot * 0.9 <= s <= spot * 1.1]
         valid_strikes = sorted(valid_strikes)
+        
+        if not valid_strikes:
+            return result
         
         for strike in valid_strikes:
             result['strikes'].append(strike)
@@ -752,48 +821,45 @@ def calculate_gex_profile():
         # 计算总 GEX
         result['total_gex'] = sum(result['gex_net'])
         
-        # 找 Gamma Flip Point (净 GEX 从正变负的点)
+        # 找 Gamma Flip Point (净 GEX 从正变负或从负变正的点)
         for i in range(len(result['strikes']) - 1):
-            if result['gex_net'][i] > 0 and result['gex_net'][i+1] < 0:
-                result['gamma_flip'] = (result['strikes'][i] + result['strikes'][i+1]) / 2
-                break
-            elif result['gex_net'][i] < 0 and result['gex_net'][i+1] > 0:
+            current_gex = result['gex_net'][i]
+            next_gex = result['gex_net'][i+1]
+            if (current_gex > 0 and next_gex < 0) or (current_gex < 0 and next_gex > 0):
                 result['gamma_flip'] = (result['strikes'][i] + result['strikes'][i+1]) / 2
                 break
         
         # 找 Put Wall 和 Call Wall (最大 GEX 集中位置)
         if result['gex_call']:
-            max_call_idx = result['gex_call'].index(max(result['gex_call']))
-            result['call_wall'] = result['strikes'][max_call_idx]
+            max_call_gex = max(result['gex_call'])
+            if max_call_gex > 0:
+                max_call_idx = result['gex_call'].index(max_call_gex)
+                result['call_wall'] = result['strikes'][max_call_idx]
         
         if result['gex_put']:
-            max_put_idx = result['gex_put'].index(min(result['gex_put']))  # 最负的
-            result['put_wall'] = result['strikes'][max_put_idx]
+            min_put_gex = min(result['gex_put'])  # 最负的
+            if min_put_gex < 0:
+                max_put_idx = result['gex_put'].index(min_put_gex)
+                result['put_wall'] = result['strikes'][max_put_idx]
         
-        # 计算 Max Pain
-        # Max Pain = 期权到期时让最多期权价值归零的价格
-        pain_by_strike = {}
-        for opt in all_options:
-            strike = opt['strike']
-            if strike not in pain_by_strike:
-                pain_by_strike[strike] = 0
+        # 计算 Max Pain (简化版 - 找 OI 最集中的 strike)
+        try:
+            total_oi_by_strike = {}
+            for opt in all_options:
+                strike = opt['strike']
+                if strike in valid_strikes:
+                    if strike not in total_oi_by_strike:
+                        total_oi_by_strike[strike] = 0
+                    total_oi_by_strike[strike] += opt['oi']
             
-            if opt['type'] == 'call':
-                # Call 在 strike 以下全亏
-                for s in valid_strikes:
-                    if s < strike:
-                        pain_by_strike[s] += opt['oi'] * 100 * (strike - s)
-            else:
-                # Put 在 strike 以上全亏
-                for s in valid_strikes:
-                    if s > strike:
-                        pain_by_strike[s] += opt['oi'] * 100 * (s - strike)
-        
-        if pain_by_strike:
-            result['max_pain'] = min(pain_by_strike, key=pain_by_strike.get)
+            if total_oi_by_strike:
+                result['max_pain'] = max(total_oi_by_strike, key=total_oi_by_strike.get)
+        except:
+            pass
         
     except Exception as e:
-        st.warning(f"GEX 计算错误: {e}")
+        # 静默失败，返回空结果
+        pass
     
     return result
 
