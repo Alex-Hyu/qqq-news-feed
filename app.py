@@ -2298,7 +2298,6 @@ def create_chart(df, structures_df, current_price, product):
 # Streamlit 界面
 # ============================================================================
 
-st.set_page_config(page_title="ES/NQ 结构位分析器", layout="wide")
 
 st.title("📊 ES/NQ 日线结构位分析器")
 st.markdown("""
