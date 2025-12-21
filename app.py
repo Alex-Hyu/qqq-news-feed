@@ -9,6 +9,7 @@ import pytz
 import feedparser
 from io import StringIO
 from transformers import pipeline
+from streamlit_autorefresh import st_autorefresh
 from scipy.stats import norm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -46,180 +47,8 @@ st.markdown("""
     .regime-risk-off {background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%); border: 2px solid #dc3545;}
     .regime-neutral {background: linear-gradient(135deg, #e2e3e5 0%, #d6d8db 100%); border: 2px solid #6c757d;}
     .export-box {background-color: #f0f7ff; border: 1px dashed #0d6efd; padding: 15px; border-radius: 8px; margin: 10px 0;}
-    .gex-level-table {font-size: 0.9em;}
-    .gex-zero-gamma {background-color: #fff3cd; font-weight: bold;}
-    .gex-put-wall {background-color: #d4edda;}
-    .gex-call-wall {background-color: #f8d7da;}
     </style>
     """, unsafe_allow_html=True)
-
-# ============================================================
-# SpotGamma 数据解析函数 (新增)
-# ============================================================
-
-def parse_spotgamma_data(text, symbol="QQQ"):
-    """
-    解析 SpotGamma 粘贴数据
-    输入格式: 价格[Tab]Level名称，每行一个
-    """
-    if not text or not text.strip():
-        return None, {}
-    
-    lines = text.strip().split('\n')
-    data = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        # 尝试 Tab 分隔
-        parts = line.split('\t')
-        if len(parts) < 2:
-            # 尝试多空格分隔
-            parts = line.split(None, 1)
-        
-        if len(parts) >= 2:
-            try:
-                price = float(parts[0].replace(',', ''))
-                level = parts[1].strip()
-                data.append({'price': price, 'level': level})
-            except ValueError:
-                continue
-    
-    if not data:
-        return None, {}
-    
-    df = pd.DataFrame(data)
-    df = df.sort_values('price', ascending=False).reset_index(drop=True)
-    
-    # 提取关键位
-    key_levels = {
-        'symbol': symbol,
-        'zero_gamma': None,
-        'put_wall': None,
-        'call_wall': None,
-        'vol_trigger': None,
-        'max_pain': None,
-        'large_gamma': [],
-        'combos': []
-    }
-    
-    for _, row in df.iterrows():
-        level_lower = row['level'].lower()
-        price = row['price']
-        
-        if 'zero gamma' in level_lower:
-            key_levels['zero_gamma'] = price
-        elif 'put wall' in level_lower:
-            key_levels['put_wall'] = price
-        elif 'call wall' in level_lower:
-            key_levels['call_wall'] = price
-        elif 'volatility trigger' in level_lower:
-            key_levels['vol_trigger'] = price
-        elif 'max pain' in level_lower:
-            key_levels['max_pain'] = price
-        elif 'large gamma' in level_lower:
-            key_levels['large_gamma'].append({'price': price, 'name': row['level']})
-        elif 'combo' in level_lower:
-            key_levels['combos'].append({'price': price, 'name': row['level']})
-    
-    return df, key_levels
-
-# ============================================================
-# Swing 结构位分析函数 (整合自独立模块)
-# ============================================================
-
-def load_and_prepare_swing_data(uploaded_file):
-    """加载并准备数据"""
-    df = pd.read_csv(uploaded_file)
-    
-    try:
-        df['time'] = pd.to_datetime(df['time'], format='%Y/%m/%d')
-    except:
-        try:
-            df['time'] = pd.to_datetime(df['time'], format='%Y-%m-%d')
-        except:
-            df['time'] = pd.to_datetime(df['time'])
-    
-    df = df.sort_values('time').reset_index(drop=True)
-    
-    df['tr'] = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift(1)),
-            abs(df['low'] - df['close'].shift(1))
-        )
-    )
-    df['atr'] = df['tr'].rolling(window=14).mean()
-    
-    return df
-
-def find_swing_points(df, left_bars=3):
-    """找出 Swing High/Low 点"""
-    swing_highs = []
-    swing_lows = []
-    
-    for i in range(left_bars, len(df)):
-        current_high = df.iloc[i]['high']
-        is_swing_high = all(df.iloc[i - j]['high'] < current_high for j in range(1, left_bars + 1))
-        if is_swing_high:
-            swing_highs.append(i)
-        
-        current_low = df.iloc[i]['low']
-        is_swing_low = all(df.iloc[i - j]['low'] > current_low for j in range(1, left_bars + 1))
-        if is_swing_low:
-            swing_lows.append(i)
-    
-    return swing_highs, swing_lows
-
-def analyze_swing_structures(df, default_atr=20, zone_width_multiplier=0.3):
-    """分析 Swing 结构位"""
-    swing_highs, swing_lows = find_swing_points(df, left_bars=3)
-    structures = []
-    
-    # 分析阻力位
-    for idx in swing_highs[-10:]:  # 只看最近10个
-        price = df.iloc[idx]['high']
-        atr = df.iloc[idx]['atr'] if not pd.isna(df.iloc[idx]['atr']) else default_atr
-        zone_width = atr * zone_width_multiplier
-        
-        structures.append({
-            'date': df.iloc[idx]['time'],
-            'type': 'resistance',
-            'level': 1 if idx in swing_highs[-3:] else 2,
-            'price': price,
-            'zone_top': price + zone_width/2,
-            'zone_bottom': price - zone_width/2,
-        })
-    
-    # 分析支撑位
-    for idx in swing_lows[-10:]:
-        price = df.iloc[idx]['low']
-        atr = df.iloc[idx]['atr'] if not pd.isna(df.iloc[idx]['atr']) else default_atr
-        zone_width = atr * zone_width_multiplier
-        
-        structures.append({
-            'date': df.iloc[idx]['time'],
-            'type': 'support',
-            'level': 1 if idx in swing_lows[-3:] else 2,
-            'price': price,
-            'zone_top': price + zone_width/2,
-            'zone_bottom': price - zone_width/2,
-        })
-    
-    return structures
-
-def get_active_swing_structures(structures, current_price, max_distance_pct=0.03):
-    """获取当前有效的结构位"""
-    active = []
-    for s in structures:
-        distance = abs(s['price'] - current_price) / current_price
-        if distance <= max_distance_pct:
-            s['distance'] = distance
-            active.append(s)
-    
-    return sorted(active, key=lambda x: (x['level'], x['distance']))
 
 # --- [侧边栏] ---
 with st.sidebar:
@@ -278,46 +107,6 @@ with st.sidebar:
     • 期权/GEX: 1小时  
     • 日内VWAP: 5分钟
     """)
-    
-    st.divider()
-    
-    # ============================================================
-    # SpotGamma 数据输入区 (新增)
-    # ============================================================
-    st.subheader("📊 SpotGamma 数据")
-    st.caption("粘贴格式: 价格[Tab]Level，每行一个")
-    
-    spotgamma_qqq = st.text_area(
-        "QQQ Levels", 
-        height=100,
-        placeholder="620\tCall Wall\n615\tZero Gamma\n600\tPut Wall",
-        key="sg_qqq"
-    )
-    
-    spotgamma_nq = st.text_area(
-        "NQ Levels", 
-        height=100,
-        placeholder="21500\tCall Wall\n21200\tZero Gamma",
-        key="sg_nq"
-    )
-    
-    spotgamma_es = st.text_area(
-        "ES Levels", 
-        height=100,
-        placeholder="6080\tCall Wall\n6020\tZero Gamma",
-        key="sg_es"
-    )
-    
-    st.divider()
-    
-    # ============================================================
-    # Swing 结构位上传区 (新增)
-    # ============================================================
-    st.subheader("📈 Swing 结构位")
-    st.caption("上传 ES/NQ 日线 CSV")
-    
-    swing_file_nq = st.file_uploader("NQ 日线数据", type=['csv'], key="swing_nq")
-    swing_file_es = st.file_uploader("ES 日线数据", type=['csv'], key="swing_es")
 
 # ============================================================
 # 1. 核心数据获取函数
@@ -1455,15 +1244,14 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     return final_score, flags, summary, action
 
 # ============================================================
-# 7. 生成导出到 Claude 的文本 (增强版)
+# 7. 生成导出到 Claude 的文本
 # ============================================================
 
-def generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news,
-                           spotgamma_data=None, swing_data_nq=None, swing_data_es=None, calendar_events=None, tactics=None):
-    """生成增强版导出文本，包含所有数据"""
+def generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news):
+    """生成可复制到 Claude 进行深度分析的文本"""
     
     export_text = f"""# 宏观战情室数据快照
-生成时间: {datetime.datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M:%S')} EST
+生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST
 
 ## 一、流动性指标
 - SOFR: {ny_fed['SOFR']:.2f}%
@@ -1490,83 +1278,18 @@ def generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_
 - 期货基差: {deriv['Futures_Basis']:.1f} ({deriv['Basis_Status']})
 - Gamma 环境: {deriv['GEX_Net']}
 - Vanna 状态: {deriv['Vanna_Status']}
-"""
-    
-    # SpotGamma 数据
-    export_text += "\n## 五、GEX 分析 (SpotGamma)\n"
-    
-    if spotgamma_data:
-        for symbol, data in spotgamma_data.items():
-            if data['df'] is not None and not data['df'].empty:
-                keys = data['keys']
-                export_text += f"\n### {symbol}\n"
-                
-                if keys.get('zero_gamma'):
-                    export_text += f"- Zero Gamma: {keys['zero_gamma']}\n"
-                if keys.get('call_wall'):
-                    export_text += f"- Call Wall: {keys['call_wall']}\n"
-                if keys.get('put_wall'):
-                    export_text += f"- Put Wall: {keys['put_wall']}\n"
-                if keys.get('vol_trigger'):
-                    export_text += f"- Volatility Trigger: {keys['vol_trigger']}\n"
-                
-                # 完整 Level 表格
-                for _, row in data['df'].iterrows():
-                    export_text += f"{row['price']}\t{row['level']}\n"
-    else:
-        # 如果没有 SpotGamma 数据，使用计算的 GEX 数据
-        export_text += f"""- 当前价格: ${gex_data['spot_price']:.2f}
+- Put Wall: ${deriv['Put_Wall']:.0f}
+- Call Wall: ${deriv['Call_Wall']:.0f}
+
+## 五、GEX 分析
+- 当前价格: ${gex_data['spot_price']:.2f}
 - 净 GEX: {gex_data['total_gex']:.2f}B
 - Gamma Flip Point: ${gex_data['gamma_flip']:.2f}
 - Max Pain: ${gex_data['max_pain']:.2f}
-- Put Wall: ${gex_data['put_wall']:.2f}
-- Call Wall: ${gex_data['call_wall']:.2f}
-"""
-    
-    # Swing 结构位数据
-    export_text += "\n## 六、结构位分析 (Swing)\n"
-    
-    if swing_data_nq and swing_data_nq.get('structures'):
-        export_text += f"\n### NQ\n"
-        export_text += f"当前价格: {swing_data_nq['current_price']:.2f} | ATR: {swing_data_nq['atr']:.2f}\n"
-        
-        resistances = [s for s in swing_data_nq['structures'] if s['type'] == 'resistance']
-        supports = [s for s in swing_data_nq['structures'] if s['type'] == 'support']
-        
-        if resistances:
-            export_text += "\n📈 阻力位:\n"
-            for r in sorted(resistances, key=lambda x: x['price'])[:3]:
-                level_str = "★一级" if r['level'] == 1 else "二级"
-                export_text += f"- {level_str}: {r['zone_bottom']:.2f} - {r['zone_top']:.2f}\n"
-        
-        if supports:
-            export_text += "\n📉 支撑位:\n"
-            for s in sorted(supports, key=lambda x: -x['price'])[:3]:
-                level_str = "★一级" if s['level'] == 1 else "二级"
-                export_text += f"- {level_str}: {s['zone_bottom']:.2f} - {s['zone_top']:.2f}\n"
-    
-    if swing_data_es and swing_data_es.get('structures'):
-        export_text += f"\n### ES\n"
-        export_text += f"当前价格: {swing_data_es['current_price']:.2f} | ATR: {swing_data_es['atr']:.2f}\n"
-        
-        resistances = [s for s in swing_data_es['structures'] if s['type'] == 'resistance']
-        supports = [s for s in swing_data_es['structures'] if s['type'] == 'support']
-        
-        if resistances:
-            export_text += "\n📈 阻力位:\n"
-            for r in sorted(resistances, key=lambda x: x['price'])[:3]:
-                level_str = "★一级" if r['level'] == 1 else "二级"
-                export_text += f"- {level_str}: {r['zone_bottom']:.2f} - {r['zone_top']:.2f}\n"
-        
-        if supports:
-            export_text += "\n📉 支撑位:\n"
-            for s in sorted(supports, key=lambda x: -s['price'])[:3]:
-                level_str = "★一级" if s['level'] == 1 else "二级"
-                export_text += f"- {level_str}: {s['zone_bottom']:.2f} - {s['zone_top']:.2f}\n"
-    
-    # 规则引擎信号
-    export_text += f"""
-## 七、规则引擎信号
+- GEX Put Wall: ${gex_data['put_wall']:.2f}
+- GEX Call Wall: ${gex_data['call_wall']:.2f}
+
+## 六、规则引擎信号
 市场状态: {regime_analysis['regime'].upper()}
 综合评分: {regime_analysis['score']:.1f}
 
@@ -1576,39 +1299,10 @@ def generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_
     for sig in regime_analysis['signals']:
         export_text += f"- [{sig['level']}] {sig['msg']}\n"
     
-    # 重点新闻
-    export_text += "\n## 八、重点新闻\n"
+    export_text += "\n## 七、重点新闻\n"
     for item in processed_news[:10]:
         cats = ", ".join(item.get('Categories', ['general']))
         export_text += f"- [{cats}] {item['Title']} (重要性: {item.get('Importance', 0)})\n"
-    
-    # 宏观日历
-    if calendar_events:
-        export_text += "\n## 九、宏观日历\n"
-        urgent_events = [e for e in calendar_events if e.get('urgency') == 'urgent']
-        soon_events = [e for e in calendar_events if e.get('urgency') == 'soon']
-        
-        if urgent_events:
-            export_text += "### 紧急关注:\n"
-            for evt in urgent_events:
-                export_text += f"- {evt.get('countdown', '')} | {evt.get('date', '')} | {evt.get('event', '')}\n"
-        
-        if soon_events:
-            export_text += "### 近期事件:\n"
-            for evt in soon_events[:5]:
-                export_text += f"- {evt.get('countdown', '')} | {evt.get('date', '')} | {evt.get('event', '')}\n"
-    
-    # 日内战术
-    if tactics:
-        export_text += f"""
-## 十、日内战术
-- VWAP: ${tactics.get('VWAP', 0):.2f}
-- 趋势: {tactics.get('Trend', 'N/A')}
-- 预期波动: ±${tactics.get('Exp_Move', 0):.2f}
-- 上轨: ${tactics.get('Upper_Band', 0):.2f}
-- 下轨: ${tactics.get('Lower_Band', 0):.2f}
-- QQQ 现价: ${tactics.get('Price', 0):.2f}
-"""
     
     export_text += """
 ---
@@ -1685,63 +1379,8 @@ with st.spinner("正在聚合全市场数据..."):
     raw_news = get_multi_source_news()
     calendar_events = get_macro_calendar_with_countdown()
     gex_data = calculate_gex_profile()
-
-# ============================================================
-# 解析 SpotGamma 数据 (在 spinner 外)
-# ============================================================
-spotgamma_data = {}
-
-# 解析 QQQ
-qqq_df, qqq_keys = parse_spotgamma_data(spotgamma_qqq, "QQQ")
-spotgamma_data['QQQ'] = {'df': qqq_df, 'keys': qqq_keys}
-
-# 解析 NQ
-nq_df, nq_keys = parse_spotgamma_data(spotgamma_nq, "NQ")
-spotgamma_data['NQ'] = {'df': nq_df, 'keys': nq_keys}
-
-# 解析 ES
-es_df, es_keys = parse_spotgamma_data(spotgamma_es, "ES")
-spotgamma_data['ES'] = {'df': es_df, 'keys': es_keys}
-
-# ============================================================
-# 处理 Swing 数据
-# ============================================================
-swing_data_nq = None
-swing_data_es = None
-
-if swing_file_nq is not None:
-    try:
-        df_nq = load_and_prepare_swing_data(swing_file_nq)
-        current_price_nq = df_nq.iloc[-1]['close']
-        current_atr_nq = df_nq.iloc[-1]['atr'] if not pd.isna(df_nq.iloc[-1]['atr']) else 80
-        structures_nq = analyze_swing_structures(df_nq, default_atr=80)
-        active_nq = get_active_swing_structures(structures_nq, current_price_nq)
-        swing_data_nq = {
-            'current_price': current_price_nq,
-            'atr': current_atr_nq,
-            'structures': active_nq,
-            'df': df_nq
-        }
-    except Exception as e:
-        st.sidebar.error(f"NQ 数据加载失败: {e}")
-
-if swing_file_es is not None:
-    try:
-        df_es = load_and_prepare_swing_data(swing_file_es)
-        current_price_es = df_es.iloc[-1]['close']
-        current_atr_es = df_es.iloc[-1]['atr'] if not pd.isna(df_es.iloc[-1]['atr']) else 20
-        structures_es = analyze_swing_structures(df_es, default_atr=20)
-        active_es = get_active_swing_structures(structures_es, current_price_es)
-        swing_data_es = {
-            'current_price': current_price_es,
-            'atr': current_atr_es,
-            'structures': active_es,
-            'df': df_es
-        }
-    except Exception as e:
-        st.sidebar.error(f"ES 数据加载失败: {e}")
-
-with st.spinner("正在分析新闻情绪..."):
+    
+    # 新闻情绪分析
     processed_news = []
     sentiment_total = 0
     weighted_sentiment = 0
@@ -1889,117 +1528,80 @@ g3.metric("Put Wall", f"${deriv['Put_Wall']}")
 g4.metric("Call Wall", f"${deriv['Call_Wall']}")
 
 with st.expander("📊 Gamma Exposure (GEX) Profile", expanded=True):
-    # 使用 Tab 显示不同来源的 GEX 数据
-    gex_tabs = st.tabs(["📈 SpotGamma (手动)", "🔄 Yahoo Finance (自动)"])
+    # 显示数据时间戳
+    gex_time_col1, gex_time_col2, gex_time_col3 = st.columns(3)
+    with gex_time_col1:
+        st.caption(f"📅 OI 数据日期: **{gex_data.get('oi_date', 'N/A')}** ({gex_data.get('oi_weekday', '')})")
+    with gex_time_col2:
+        st.caption(f"⏰ 计算时间: **{gex_data.get('calc_time', 'N/A')}**")
+    with gex_time_col3:
+        st.caption("💡 OI 每天盘前更新，反映前一交易日收盘持仓")
     
-    # Tab 1: SpotGamma 数据
-    with gex_tabs[0]:
-        has_spotgamma = any(data['df'] is not None for data in spotgamma_data.values())
+    if gex_data['strikes']:
+        col_gex1, col_gex2 = st.columns([2, 1])
         
-        if has_spotgamma:
-            sg_cols = st.columns(3)
+        with col_gex1:
+            fig_gex = go.Figure()
             
-            for idx, (symbol, data) in enumerate(spotgamma_data.items()):
-                with sg_cols[idx]:
-                    st.markdown(f"### {symbol}")
-                    
-                    if data['df'] is not None and not data['df'].empty:
-                        keys = data['keys']
-                        
-                        # 显示关键位
-                        if keys.get('zero_gamma'):
-                            st.metric("Zero Gamma", f"{keys['zero_gamma']}")
-                        if keys.get('call_wall'):
-                            st.metric("Call Wall", f"{keys['call_wall']}")
-                        if keys.get('put_wall'):
-                            st.metric("Put Wall", f"{keys['put_wall']}")
-                        if keys.get('vol_trigger'):
-                            st.caption(f"Vol Trigger: {keys['vol_trigger']}")
-                        
-                        st.markdown("---")
-                        st.caption("完整 Level:")
-                        st.dataframe(data['df'], use_container_width=True, hide_index=True, height=200)
-                    else:
-                        st.info(f"请在侧边栏输入 {symbol} 的 SpotGamma 数据")
-        else:
-            st.info("👈 请在侧边栏粘贴 SpotGamma 数据 (QQQ/NQ/ES)")
-            st.caption("格式: 价格[Tab]Level名称，每行一个")
-    
-    # Tab 2: Yahoo Finance 计算的 GEX
-    with gex_tabs[1]:
-        gex_time_col1, gex_time_col2, gex_time_col3 = st.columns(3)
-        with gex_time_col1:
-            st.caption(f"📅 OI 数据日期: **{gex_data.get('oi_date', 'N/A')}** ({gex_data.get('oi_weekday', '')})")
-        with gex_time_col2:
-            st.caption(f"⏰ 计算时间: **{gex_data.get('calc_time', 'N/A')}**")
-        with gex_time_col3:
-            st.caption("💡 OI 每天盘前更新，反映前一交易日收盘持仓")
+            fig_gex.add_trace(go.Bar(
+                x=gex_data['strikes'],
+                y=gex_data['gex_call'],
+                name='Call GEX',
+                marker_color='#198754',
+                opacity=0.7
+            ))
+            
+            fig_gex.add_trace(go.Bar(
+                x=gex_data['strikes'],
+                y=gex_data['gex_put'],
+                name='Put GEX',
+                marker_color='#dc3545',
+                opacity=0.7
+            ))
+            
+            fig_gex.add_trace(go.Scatter(
+                x=gex_data['strikes'],
+                y=gex_data['gex_net'],
+                name='Net GEX',
+                line=dict(color='#0d6efd', width=3)
+            ))
+            
+            fig_gex.add_vline(x=gex_data['spot_price'], line_dash="dash", line_color="yellow",
+                             annotation_text=f"现价 ${gex_data['spot_price']:.2f}")
+            
+            if gex_data['gamma_flip'] > 0:
+                fig_gex.add_vline(x=gex_data['gamma_flip'], line_dash="dot", line_color="orange",
+                                 annotation_text=f"Gamma Flip ${gex_data['gamma_flip']:.0f}")
+            
+            fig_gex.update_layout(
+                title="GEX Distribution by Strike",
+                xaxis_title="Strike Price",
+                yaxis_title="GEX (Billions $)",
+                barmode='relative',
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02)
+            )
+            
+            st.plotly_chart(fig_gex, use_container_width=True)
         
-        if gex_data['strikes']:
-            col_gex1, col_gex2 = st.columns([2, 1])
+        with col_gex2:
+            st.markdown("#### 📍 关键位置")
+            st.metric("当前价格", f"${gex_data['spot_price']:.2f}")
+            st.metric("净 GEX", f"{gex_data['total_gex']:.2f}B", 
+                     "正 Gamma ✅" if gex_data['total_gex'] > 0 else "负 Gamma ⚠️")
+            st.metric("Gamma Flip", f"${gex_data['gamma_flip']:.2f}" if gex_data['gamma_flip'] > 0 else "N/A")
+            st.metric("Max Pain", f"${gex_data['max_pain']:.2f}" if gex_data['max_pain'] > 0 else "N/A")
+            st.metric("GEX Put Wall", f"${gex_data['put_wall']:.2f}" if gex_data['put_wall'] > 0 else "N/A")
+            st.metric("GEX Call Wall", f"${gex_data['call_wall']:.2f}" if gex_data['call_wall'] > 0 else "N/A")
             
-            with col_gex1:
-                fig_gex = go.Figure()
-                
-                fig_gex.add_trace(go.Bar(
-                    x=gex_data['strikes'],
-                    y=gex_data['gex_call'],
-                    name='Call GEX',
-                    marker_color='#198754',
-                    opacity=0.7
-                ))
-                
-                fig_gex.add_trace(go.Bar(
-                    x=gex_data['strikes'],
-                    y=gex_data['gex_put'],
-                    name='Put GEX',
-                    marker_color='#dc3545',
-                    opacity=0.7
-                ))
-                
-                fig_gex.add_trace(go.Scatter(
-                    x=gex_data['strikes'],
-                    y=gex_data['gex_net'],
-                    name='Net GEX',
-                    line=dict(color='#0d6efd', width=3)
-                ))
-                
-                fig_gex.add_vline(x=gex_data['spot_price'], line_dash="dash", line_color="yellow",
-                                 annotation_text=f"现价 ${gex_data['spot_price']:.2f}")
-                
-                if gex_data['gamma_flip'] > 0:
-                    fig_gex.add_vline(x=gex_data['gamma_flip'], line_dash="dot", line_color="orange",
-                                     annotation_text=f"Gamma Flip ${gex_data['gamma_flip']:.0f}")
-                
-                fig_gex.update_layout(
-                    title="GEX Distribution by Strike",
-                    xaxis_title="Strike Price",
-                    yaxis_title="GEX (Billions $)",
-                    barmode='relative',
-                    height=400,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02)
-                )
-                
-                st.plotly_chart(fig_gex, use_container_width=True)
-            
-            with col_gex2:
-                st.markdown("#### 📍 关键位置")
-                st.metric("当前价格", f"${gex_data['spot_price']:.2f}")
-                st.metric("净 GEX", f"{gex_data['total_gex']:.2f}B", 
-                         "正 Gamma ✅" if gex_data['total_gex'] > 0 else "负 Gamma ⚠️")
-                st.metric("Gamma Flip", f"${gex_data['gamma_flip']:.2f}" if gex_data['gamma_flip'] > 0 else "N/A")
-                st.metric("Max Pain", f"${gex_data['max_pain']:.2f}" if gex_data['max_pain'] > 0 else "N/A")
-                st.metric("GEX Put Wall", f"${gex_data['put_wall']:.2f}" if gex_data['put_wall'] > 0 else "N/A")
-                st.metric("GEX Call Wall", f"${gex_data['call_wall']:.2f}" if gex_data['call_wall'] > 0 else "N/A")
-                
-                st.markdown("---")
-                st.markdown("**解读:**")
-                if gex_data['total_gex'] > 0:
-                    st.success("正 Gamma: 做市商高抛低吸，波动收敛")
-                else:
-                    st.warning("负 Gamma: 做市商追涨杀跌，波动放大")
-        else:
-            st.info("GEX 数据计算中...")
+            st.markdown("---")
+            st.markdown("**解读:**")
+            if gex_data['total_gex'] > 0:
+                st.success("正 Gamma: 做市商高抛低吸，波动收敛")
+            else:
+                st.warning("负 Gamma: 做市商追涨杀跌，波动放大")
+    else:
+        st.info("GEX 数据计算中...")
 
 with st.expander("📚 战术手册：指标深度解读", expanded=False):
     st.markdown("""
@@ -2059,78 +1661,8 @@ for category, signals in signal_categories.items():
     col_idx += 1
 
 st.markdown("---")
-
-# ============================================================
-# 4.5 Swing 结构位分析 (新增)
-# ============================================================
-if swing_data_nq or swing_data_es:
-    st.subheader("4.5 📈 Swing 结构位分析")
-    
-    swing_cols = st.columns(2)
-    
-    with swing_cols[0]:
-        if swing_data_nq:
-            st.markdown("### NQ")
-            st.metric("当前价格", f"{swing_data_nq['current_price']:.2f}")
-            st.caption(f"ATR(14): {swing_data_nq['atr']:.2f} 点")
-            
-            if swing_data_nq['structures']:
-                resistances = [s for s in swing_data_nq['structures'] if s['type'] == 'resistance']
-                supports = [s for s in swing_data_nq['structures'] if s['type'] == 'support']
-                
-                if resistances:
-                    st.markdown("**📈 阻力位:**")
-                    for r in sorted(resistances, key=lambda x: x['price'])[:3]:
-                        level_str = "★一级" if r['level'] == 1 else "二级"
-                        st.write(f"- {level_str}: {r['zone_bottom']:.2f} - {r['zone_top']:.2f}")
-                
-                if supports:
-                    st.markdown("**📉 支撑位:**")
-                    for s in sorted(supports, key=lambda x: -s['price'])[:3]:
-                        level_str = "★一级" if s['level'] == 1 else "二级"
-                        st.write(f"- {level_str}: {s['zone_bottom']:.2f} - {s['zone_top']:.2f}")
-            else:
-                st.info("未检测到有效结构位")
-        else:
-            st.info("👈 请在侧边栏上传 NQ 日线数据")
-    
-    with swing_cols[1]:
-        if swing_data_es:
-            st.markdown("### ES")
-            st.metric("当前价格", f"{swing_data_es['current_price']:.2f}")
-            st.caption(f"ATR(14): {swing_data_es['atr']:.2f} 点")
-            
-            if swing_data_es['structures']:
-                resistances = [s for s in swing_data_es['structures'] if s['type'] == 'resistance']
-                supports = [s for s in swing_data_es['structures'] if s['type'] == 'support']
-                
-                if resistances:
-                    st.markdown("**📈 阻力位:**")
-                    for r in sorted(resistances, key=lambda x: x['price'])[:3]:
-                        level_str = "★一级" if r['level'] == 1 else "二级"
-                        st.write(f"- {level_str}: {r['zone_bottom']:.2f} - {r['zone_top']:.2f}")
-                
-                if supports:
-                    st.markdown("**📉 支撑位:**")
-                    for s in sorted(supports, key=lambda x: -s['price'])[:3]:
-                        level_str = "★一级" if s['level'] == 1 else "二级"
-                        st.write(f"- {level_str}: {s['zone_bottom']:.2f} - {s['zone_top']:.2f}")
-            else:
-                st.info("未检测到有效结构位")
-        else:
-            st.info("👈 请在侧边栏上传 ES 日线数据")
-    
-    st.divider()
-
 with st.expander("🤖 导出到 Claude 进行深度分析", expanded=False):
-    export_text = generate_claude_export(
-        ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news,
-        spotgamma_data=spotgamma_data,
-        swing_data_nq=swing_data_nq,
-        swing_data_es=swing_data_es,
-        calendar_events=calendar_events,
-        tactics=tactics
-    )
+    export_text = generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news)
     
     st.markdown("""
     <div class="export-box">
@@ -2323,3 +1855,569 @@ if stats:
         *   **统计结论**: 美股大部分时间 (约 60%+) 处于震荡中，单边暴跌或暴涨其实是少数。**日内交易切忌频繁止损去赌突破。**
         """)
 
+"""
+ES/NQ 日线结构位分析器
+根据Swing High/Low筛选条件识别一级和二级结构位
+输出Zone区间供日内交易参考
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ============================================================================
+# 产品配置
+# ============================================================================
+PRODUCT_CONFIG = {
+    'ES': {
+        'name': 'ES (E-mini S&P 500)',
+        'default_atr': 20,
+        'price_format': '#.00',
+        'description': 'ES价格约6000-7000点，ATR约15-25点'
+    },
+    'NQ': {
+        'name': 'NQ (E-mini Nasdaq 100)',
+        'default_atr': 80,
+        'price_format': '#.00',
+        'description': 'NQ价格约20000-22000点，ATR约60-100点'
+    }
+}
+
+# ============================================================================
+# 核心计算函数
+# ============================================================================
+
+def load_and_prepare_data(uploaded_file):
+    """加载并准备数据"""
+    df = pd.read_csv(uploaded_file)
+    
+    # 尝试多种日期格式
+    try:
+        df['time'] = pd.to_datetime(df['time'], format='%Y/%m/%d')
+    except:
+        try:
+            df['time'] = pd.to_datetime(df['time'], format='%Y-%m-%d')
+        except:
+            df['time'] = pd.to_datetime(df['time'])
+    
+    df = df.sort_values('time').reset_index(drop=True)
+    
+    # 计算ATR(14)
+    df['tr'] = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(
+            abs(df['high'] - df['close'].shift(1)),
+            abs(df['low'] - df['close'].shift(1))
+        )
+    )
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    
+    # 计算ATR均值（用于判断ATR扩张）
+    df['atr_ma'] = df['atr'].rolling(window=20).mean()
+    
+    return df
+
+
+def find_swing_candidates(df, left_bars=3):
+    """
+    找出候选Swing点
+    Swing High: 当日High > 前left_bars日所有High
+    Swing Low: 当日Low < 前left_bars日所有Low
+    """
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(left_bars, len(df)):
+        # 检查Swing High
+        current_high = df.iloc[i]['high']
+        is_swing_high = True
+        for j in range(1, left_bars + 1):
+            if df.iloc[i - j]['high'] >= current_high:
+                is_swing_high = False
+                break
+        if is_swing_high:
+            swing_highs.append(i)
+        
+        # 检查Swing Low
+        current_low = df.iloc[i]['low']
+        is_swing_low = True
+        for j in range(1, left_bars + 1):
+            if df.iloc[i - j]['low'] <= current_low:
+                is_swing_low = False
+                break
+        if is_swing_low:
+            swing_lows.append(i)
+    
+    return swing_highs, swing_lows
+
+
+def validate_directional_extension(df, idx, is_high, lookforward=5, atr_multiplier=1.5):
+    """
+    条件一：验证方向性延伸
+    - 至少3-5根同方向K线
+    - 总移动幅度 >= 1.5 × ATR
+    - 未被快速完全反向吞没
+    """
+    if idx + lookforward >= len(df):
+        return False, 0
+    
+    atr = df.iloc[idx]['atr']
+    if pd.isna(atr):
+        return False, 0
+    
+    required_move = atr * atr_multiplier
+    
+    if is_high:
+        # Swing High后应该向下延伸
+        start_price = df.iloc[idx]['high']
+        min_price = df.iloc[idx + 1: idx + lookforward + 1]['low'].min()
+        move = start_price - min_price
+        
+        # 检查是否被快速吞没（后续K线没有立即创新高）
+        max_high_after = df.iloc[idx + 1: idx + lookforward + 1]['high'].max()
+        if max_high_after > start_price:
+            return False, 0
+    else:
+        # Swing Low后应该向上延伸
+        start_price = df.iloc[idx]['low']
+        max_price = df.iloc[idx + 1: idx + lookforward + 1]['high'].max()
+        move = max_price - start_price
+        
+        # 检查是否被快速吞没
+        min_low_after = df.iloc[idx + 1: idx + lookforward + 1]['low'].min()
+        if min_low_after < start_price:
+            return False, 0
+    
+    return move >= required_move, move
+
+
+def validate_structure_break(df, swing_highs, swing_lows, idx, is_high):
+    """
+    条件二：打破前一轮结构
+    Swing High有效：后续价格突破了前一个Lower High
+    Swing Low有效：后续价格突破了前一个Higher Low
+    """
+    if is_high:
+        prev_highs = [h for h in swing_highs if h < idx]
+        if len(prev_highs) < 2:
+            return True
+        
+        prev_high_idx = prev_highs[-1]
+        prev_prev_high_idx = prev_highs[-2]
+        
+        current_high = df.iloc[idx]['high']
+        prev_high = df.iloc[prev_high_idx]['high']
+        prev_prev_high = df.iloc[prev_prev_high_idx]['high']
+        
+        if current_high > prev_high or (prev_high < prev_prev_high and current_high > prev_high):
+            return True
+    else:
+        prev_lows = [l for l in swing_lows if l < idx]
+        if len(prev_lows) < 2:
+            return True
+        
+        prev_low_idx = prev_lows[-1]
+        prev_prev_low_idx = prev_lows[-2]
+        
+        current_low = df.iloc[idx]['low']
+        prev_low = df.iloc[prev_low_idx]['low']
+        prev_prev_low = df.iloc[prev_prev_low_idx]['low']
+        
+        if current_low < prev_low or (prev_low > prev_prev_low and current_low < prev_low):
+            return True
+    
+    return False
+
+
+def check_volatility_expansion(df, idx):
+    """
+    条件三（加分项）：波动率扩张
+    当日ATR > 1.3 × ATR均值
+    """
+    atr = df.iloc[idx]['atr']
+    atr_ma = df.iloc[idx]['atr_ma']
+    
+    if pd.isna(atr) or pd.isna(atr_ma):
+        return False
+    
+    return atr > atr_ma * 1.3
+
+
+def classify_structure_level(df, idx, is_high, move_size, has_volatility_expansion):
+    """
+    结构分级
+    一级：趋势起点/终点/反转点 + 波动率扩张
+    二级：趋势中段回撤点
+    """
+    atr = df.iloc[idx]['atr']
+    if pd.isna(atr):
+        return 2
+    
+    if move_size > atr * 2 and has_volatility_expansion:
+        return 1
+    
+    if move_size > atr * 2.5:
+        return 1
+    
+    return 2
+
+
+def calculate_zone(df, idx, is_high, zone_width_multiplier=0.3, default_atr=20):
+    """
+    计算Zone区间
+    区间宽度 = 0.2-0.4 × ATR
+    """
+    atr = df.iloc[idx]['atr']
+    if pd.isna(atr):
+        atr = default_atr
+    
+    zone_width = atr * zone_width_multiplier
+    
+    if is_high:
+        price = df.iloc[idx]['high']
+        zone_top = price + zone_width / 2
+        zone_bottom = price - zone_width / 2
+    else:
+        price = df.iloc[idx]['low']
+        zone_top = price + zone_width / 2
+        zone_bottom = price - zone_width / 2
+    
+    return zone_top, zone_bottom, price
+
+
+def analyze_structures(df, default_atr=20, zone_width_multiplier=0.3):
+    """
+    主分析函数：识别所有合格结构位
+    """
+    swing_highs, swing_lows = find_swing_candidates(df, left_bars=3)
+    
+    structures = []
+    
+    # 分析Swing Highs
+    for idx in swing_highs:
+        valid_extension, move_size = validate_directional_extension(df, idx, is_high=True)
+        if not valid_extension:
+            continue
+        
+        valid_break = validate_structure_break(df, swing_highs, swing_lows, idx, is_high=True)
+        if not valid_break:
+            continue
+        
+        has_vol_expansion = check_volatility_expansion(df, idx)
+        level = classify_structure_level(df, idx, is_high=True, move_size=move_size, has_volatility_expansion=has_vol_expansion)
+        zone_top, zone_bottom, price = calculate_zone(df, idx, is_high=True, zone_width_multiplier=zone_width_multiplier, default_atr=default_atr)
+        
+        structures.append({
+            'date': df.iloc[idx]['time'],
+            'type': 'resistance',
+            'level': level,
+            'price': price,
+            'zone_top': zone_top,
+            'zone_bottom': zone_bottom,
+            'move_size': move_size,
+            'vol_expansion': has_vol_expansion,
+            'idx': idx
+        })
+    
+    # 分析Swing Lows
+    for idx in swing_lows:
+        valid_extension, move_size = validate_directional_extension(df, idx, is_high=False)
+        if not valid_extension:
+            continue
+        
+        valid_break = validate_structure_break(df, swing_highs, swing_lows, idx, is_high=False)
+        if not valid_break:
+            continue
+        
+        has_vol_expansion = check_volatility_expansion(df, idx)
+        level = classify_structure_level(df, idx, is_high=False, move_size=move_size, has_volatility_expansion=has_vol_expansion)
+        zone_top, zone_bottom, price = calculate_zone(df, idx, is_high=False, zone_width_multiplier=zone_width_multiplier, default_atr=default_atr)
+        
+        structures.append({
+            'date': df.iloc[idx]['time'],
+            'type': 'support',
+            'level': level,
+            'price': price,
+            'zone_top': zone_top,
+            'zone_bottom': zone_bottom,
+            'move_size': move_size,
+            'vol_expansion': has_vol_expansion,
+            'idx': idx
+        })
+    
+    return pd.DataFrame(structures)
+
+
+def get_active_structures(structures_df, current_price):
+    """
+    获取当前仍然有效的结构位
+    """
+    if structures_df.empty:
+        return pd.DataFrame()
+    
+    active = []
+    
+    for _, row in structures_df.iterrows():
+        if row['type'] == 'resistance':
+            if current_price < row['zone_top']:
+                active.append(row)
+        else:
+            if current_price > row['zone_bottom']:
+                active.append(row)
+    
+    return pd.DataFrame(active)
+
+
+def format_output(structures_df, current_price, product):
+    """
+    格式化输出结果
+    """
+    if structures_df.empty:
+        return "未找到有效结构位"
+    
+    resistances = structures_df[structures_df['type'] == 'resistance'].sort_values('price', ascending=True)
+    supports = structures_df[structures_df['type'] == 'support'].sort_values('price', ascending=False)
+    
+    output_lines = []
+    output_lines.append(f"{product} 结构位分析")
+    output_lines.append(f"当前价格: {current_price:.2f}")
+    output_lines.append("=" * 40)
+    
+    output_lines.append("\n📈 阻力位 (Resistance)")
+    output_lines.append("-" * 40)
+    
+    r1_count = 0
+    r2_count = 0
+    for _, row in resistances.iterrows():
+        level_str = "★一级" if row['level'] == 1 else "二级"
+        vol_str = " [放量]" if row['vol_expansion'] else ""
+        distance = row['price'] - current_price
+        output_lines.append(
+            f"{level_str}: {row['zone_bottom']:.2f} - {row['zone_top']:.2f} "
+            f"(+{distance:.2f}点){vol_str}"
+        )
+        if row['level'] == 1:
+            r1_count += 1
+        else:
+            r2_count += 1
+    
+    output_lines.append("\n📉 支撑位 (Support)")
+    output_lines.append("-" * 40)
+    
+    s1_count = 0
+    s2_count = 0
+    for _, row in supports.iterrows():
+        level_str = "★一级" if row['level'] == 1 else "二级"
+        vol_str = " [放量]" if row['vol_expansion'] else ""
+        distance = current_price - row['price']
+        output_lines.append(
+            f"{level_str}: {row['zone_bottom']:.2f} - {row['zone_top']:.2f} "
+            f"(-{distance:.2f}点){vol_str}"
+        )
+        if row['level'] == 1:
+            s1_count += 1
+        else:
+            s2_count += 1
+    
+    output_lines.append("\n" + "=" * 40)
+    output_lines.append(f"统计: 一级阻力{r1_count}个, 二级阻力{r2_count}个, 一级支撑{s1_count}个, 二级支撑{s2_count}个")
+    
+    return "\n".join(output_lines)
+
+
+def create_chart(df, structures_df, current_price, product):
+    """
+    创建K线图并标注结构位
+    """
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03,
+                        row_heights=[0.7, 0.3])
+    
+    fig.add_trace(
+        go.Candlestick(
+            x=df['time'],
+            open=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name=product
+        ),
+        row=1, col=1
+    )
+    
+    for _, row in structures_df.iterrows():
+        color = 'rgba(255, 0, 0, 0.2)' if row['type'] == 'resistance' else 'rgba(0, 255, 0, 0.2)'
+        border_color = 'red' if row['type'] == 'resistance' else 'green'
+        line_width = 2 if row['level'] == 1 else 1
+        
+        fig.add_hrect(
+            y0=row['zone_bottom'],
+            y1=row['zone_top'],
+            fillcolor=color,
+            line=dict(color=border_color, width=line_width),
+            row=1, col=1
+        )
+        
+        level_str = "L1" if row['level'] == 1 else "L2"
+        type_str = "R" if row['type'] == 'resistance' else "S"
+        fig.add_annotation(
+            x=df['time'].iloc[-1],
+            y=row['price'],
+            text=f"{type_str}{level_str}: {row['price']:.0f}",
+            showarrow=False,
+            xanchor='left',
+            font=dict(size=10, color=border_color),
+            row=1, col=1
+        )
+    
+    fig.add_hline(y=current_price, line_dash="dash", line_color="blue",
+                  annotation_text=f"当前: {current_price:.2f}", row=1, col=1)
+    
+    fig.add_trace(
+        go.Scatter(x=df['time'], y=df['atr'], name='ATR(14)', line=dict(color='orange')),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['time'], y=df['atr_ma'], name='ATR MA(20)', line=dict(color='gray', dash='dash')),
+        row=2, col=1
+    )
+    
+    fig.update_layout(
+        title=f'{product} 日线结构位分析',
+        xaxis_rangeslider_visible=False,
+        height=800
+    )
+    
+    return fig
+
+
+# ============================================================================
+# Streamlit 界面
+# ============================================================================
+
+st.set_page_config(page_title="ES/NQ 结构位分析器", layout="wide")
+
+st.title("📊 ES/NQ 日线结构位分析器")
+st.markdown("""
+基于Swing High/Low识别有效结构位，输出Zone区间供日内交易参考。
+
+**筛选条件：**
+1. 方向性延伸 ≥ 1.5× ATR
+2. 打破前一轮结构形态
+3. 波动率扩张（加分项）
+""")
+
+# 侧边栏
+st.sidebar.header("📌 选择产品")
+product = st.sidebar.selectbox(
+    "选择分析的产品",
+    options=['ES', 'NQ'],
+    format_func=lambda x: PRODUCT_CONFIG[x]['name']
+)
+
+st.sidebar.markdown(f"**{PRODUCT_CONFIG[product]['description']}**")
+
+st.sidebar.header("⚙️ 参数设置")
+left_bars = st.sidebar.slider("Swing检测左侧K线数", 2, 5, 3)
+lookforward = st.sidebar.slider("延伸确认K线数", 3, 7, 5)
+atr_multiplier = st.sidebar.slider("ATR倍数阈值", 1.0, 2.5, 1.5)
+zone_width = st.sidebar.slider("Zone宽度(ATR倍数)", 0.2, 0.5, 0.3)
+
+# 获取产品配置
+config = PRODUCT_CONFIG[product]
+
+# 文件上传
+st.subheader(f"📁 上传 {product} 日线数据")
+uploaded_file = st.file_uploader(f"上传{product}日线CSV文件", type=['csv'])
+
+if uploaded_file is not None:
+    # 加载数据
+    df = load_and_prepare_data(uploaded_file)
+    
+    st.success(f"✅ 数据加载成功: {len(df)}个交易日 ({df['time'].min().strftime('%Y-%m-%d')} 至 {df['time'].max().strftime('%Y-%m-%d')})")
+    
+    # 当前价格和ATR
+    current_price = df.iloc[-1]['close']
+    current_atr = df.iloc[-1]['atr']
+    
+    st.info(f"📊 **{product}** | 当前价格: {current_price:.2f} | ATR(14): {current_atr:.2f} 点 | Zone宽度约: {current_atr * zone_width:.2f} 点")
+    
+    # 分析结构
+    with st.spinner("正在分析结构位..."):
+        all_structures = analyze_structures(df, default_atr=config['default_atr'], zone_width_multiplier=zone_width)
+        active_structures = get_active_structures(all_structures, current_price)
+    
+    # 显示结果
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("📋 当前有效结构位")
+        output_text = format_output(active_structures, current_price, product)
+        st.code(output_text, language=None)
+        
+        # TradingView输入格式
+        st.subheader("📝 TradingView快速输入")
+        if not active_structures.empty:
+            tv_lines = []
+            resistances = active_structures[active_structures['type'] == 'resistance'].sort_values('price')
+            supports = active_structures[active_structures['type'] == 'support'].sort_values('price', ascending=False)
+            
+            for i, (_, row) in enumerate(resistances.head(2).iterrows()):
+                tv_lines.append(f"R{i+1}_top = {row['zone_top']:.2f}")
+                tv_lines.append(f"R{i+1}_bottom = {row['zone_bottom']:.2f}")
+            
+            for i, (_, row) in enumerate(supports.head(2).iterrows()):
+                tv_lines.append(f"S{i+1}_top = {row['zone_top']:.2f}")
+                tv_lines.append(f"S{i+1}_bottom = {row['zone_bottom']:.2f}")
+            
+            st.code("\n".join(tv_lines), language=None)
+    
+    with col2:
+        st.subheader("📈 K线图")
+        fig = create_chart(df, active_structures, current_price, product)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # 详细数据表
+    with st.expander("查看所有检测到的结构位"):
+        if not all_structures.empty:
+            display_df = all_structures.copy()
+            display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+            display_df['level'] = display_df['level'].map({1: '一级', 2: '二级'})
+            display_df['type'] = display_df['type'].map({'resistance': '阻力', 'support': '支撑'})
+            display_df = display_df[['date', 'type', 'level', 'price', 'zone_top', 'zone_bottom', 'move_size', 'vol_expansion']]
+            display_df.columns = ['日期', '类型', '级别', '价格', 'Zone上沿', 'Zone下沿', '延伸幅度', '放量']
+            st.dataframe(display_df, use_container_width=True)
+        else:
+            st.info("未检测到符合条件的结构位")
+
+else:
+    st.info(f"👆 请先在左侧选择产品（ES/NQ），然后上传对应的日线CSV文件")
+    
+    st.markdown("""
+    ### 如何导出数据
+    1. 在TradingView打开对应产品的日线图
+       - ES: `ES1!` 或 `ESH2025`
+       - NQ: `NQ1!` 或 `NQH2025`
+    2. 确保时间框架选择 **1D (日线)**
+    3. 图表右上角菜单 → **Export chart data**
+    4. 下载CSV文件并上传到这里
+    
+    ### CSV格式要求
+    ```
+    time,open,high,low,close,Volume
+    2025/6/2,5898.75,5955.5,5867.5,5947.25,1194125
+    ...
+    ```
+    
+    ### ES vs NQ 参考
+    | 产品 | 价格范围 | ATR范围 | Zone宽度 |
+    |------|----------|---------|----------|
+    | ES | 6000-7000 | 15-25点 | ~6点 |
+    | NQ | 20000-22000 | 60-100点 | ~24点 |
+    """)
+
+
+    
