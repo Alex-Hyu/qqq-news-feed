@@ -2401,3 +2401,564 @@ else:
     ...
     ```
     """)
+
+ """
+NQ 日线结构位分析器
+根据Swing High/Low筛选条件识别一级和二级结构位
+输出Zone区间供日内交易参考
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ============================================================================
+# 核心计算函数
+# ============================================================================
+
+def load_and_prepare_data(uploaded_file):
+    """加载并准备数据"""
+    df = pd.read_csv(uploaded_file)
+    df['time'] = pd.to_datetime(df['time'], format='%Y/%m/%d')
+    df = df.sort_values('time').reset_index(drop=True)
+    
+    # 计算ATR(14)
+    df['tr'] = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(
+            abs(df['high'] - df['close'].shift(1)),
+            abs(df['low'] - df['close'].shift(1))
+        )
+    )
+    df['atr'] = df['tr'].rolling(window=14).mean()
+    
+    # 计算ATR均值（用于判断ATR扩张）
+    df['atr_ma'] = df['atr'].rolling(window=20).mean()
+    
+    return df
+
+
+def find_swing_candidates(df, left_bars=3):
+    """
+    找出候选Swing点
+    Swing High: 当日High > 前left_bars日所有High
+    Swing Low: 当日Low < 前left_bars日所有Low
+    """
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(left_bars, len(df)):
+        # 检查Swing High
+        current_high = df.iloc[i]['high']
+        is_swing_high = True
+        for j in range(1, left_bars + 1):
+            if df.iloc[i - j]['high'] >= current_high:
+                is_swing_high = False
+                break
+        if is_swing_high:
+            swing_highs.append(i)
+        
+        # 检查Swing Low
+        current_low = df.iloc[i]['low']
+        is_swing_low = True
+        for j in range(1, left_bars + 1):
+            if df.iloc[i - j]['low'] <= current_low:
+                is_swing_low = False
+                break
+        if is_swing_low:
+            swing_lows.append(i)
+    
+    return swing_highs, swing_lows
+
+
+def validate_directional_extension(df, idx, is_high, lookforward=5, atr_multiplier=1.5):
+    """
+    条件一：验证方向性延伸
+    - 至少3-5根同方向K线
+    - 总移动幅度 >= 1.5 × ATR
+    - 未被快速完全反向吞没
+    """
+    if idx + lookforward >= len(df):
+        return False, 0
+    
+    atr = df.iloc[idx]['atr']
+    if pd.isna(atr):
+        return False, 0
+    
+    required_move = atr * atr_multiplier
+    
+    if is_high:
+        # Swing High后应该向下延伸
+        start_price = df.iloc[idx]['high']
+        min_price = df.iloc[idx + 1: idx + lookforward + 1]['low'].min()
+        move = start_price - min_price
+        
+        # 检查是否被快速吞没（后续K线没有立即创新高）
+        max_high_after = df.iloc[idx + 1: idx + lookforward + 1]['high'].max()
+        if max_high_after > start_price:
+            return False, 0
+    else:
+        # Swing Low后应该向上延伸
+        start_price = df.iloc[idx]['low']
+        max_price = df.iloc[idx + 1: idx + lookforward + 1]['high'].max()
+        move = max_price - start_price
+        
+        # 检查是否被快速吞没
+        min_low_after = df.iloc[idx + 1: idx + lookforward + 1]['low'].min()
+        if min_low_after < start_price:
+            return False, 0
+    
+    return move >= required_move, move
+
+
+def validate_structure_break(df, swing_highs, swing_lows, idx, is_high):
+    """
+    条件二：打破前一轮结构
+    Swing High有效：后续价格突破了前一个Lower High
+    Swing Low有效：后续价格突破了前一个Higher Low
+    
+    简化版：检查是否形成了更高的高点或更低的低点
+    """
+    if is_high:
+        # 找前一个Swing High
+        prev_highs = [h for h in swing_highs if h < idx]
+        if len(prev_highs) < 2:
+            return True  # 数据不足，默认通过
+        
+        prev_high_idx = prev_highs[-1]
+        prev_prev_high_idx = prev_highs[-2]
+        
+        current_high = df.iloc[idx]['high']
+        prev_high = df.iloc[prev_high_idx]['high']
+        prev_prev_high = df.iloc[prev_prev_high_idx]['high']
+        
+        # 如果形成Higher High或打破Lower High序列
+        if current_high > prev_high or (prev_high < prev_prev_high and current_high > prev_high):
+            return True
+    else:
+        # 找前一个Swing Low
+        prev_lows = [l for l in swing_lows if l < idx]
+        if len(prev_lows) < 2:
+            return True
+        
+        prev_low_idx = prev_lows[-1]
+        prev_prev_low_idx = prev_lows[-2]
+        
+        current_low = df.iloc[idx]['low']
+        prev_low = df.iloc[prev_low_idx]['low']
+        prev_prev_low = df.iloc[prev_prev_low_idx]['low']
+        
+        # 如果形成Lower Low或打破Higher Low序列
+        if current_low < prev_low or (prev_low > prev_prev_low and current_low < prev_low):
+            return True
+    
+    return False
+
+
+def check_volatility_expansion(df, idx):
+    """
+    条件三（加分项）：波动率扩张
+    当日ATR > 1.3 × ATR均值
+    """
+    atr = df.iloc[idx]['atr']
+    atr_ma = df.iloc[idx]['atr_ma']
+    
+    if pd.isna(atr) or pd.isna(atr_ma):
+        return False
+    
+    return atr > atr_ma * 1.3
+
+
+def classify_structure_level(df, idx, is_high, move_size, has_volatility_expansion):
+    """
+    结构分级
+    一级：趋势起点/终点/反转点 + 波动率扩张
+    二级：趋势中段回撤点
+    """
+    atr = df.iloc[idx]['atr']
+    if pd.isna(atr):
+        return 2
+    
+    # 移动幅度大于2倍ATR且有波动率扩张 -> 一级
+    if move_size > atr * 2 and has_volatility_expansion:
+        return 1
+    
+    # 移动幅度大于2.5倍ATR（即使没有波动率扩张）-> 一级
+    if move_size > atr * 2.5:
+        return 1
+    
+    return 2
+
+
+def calculate_zone(df, idx, is_high, zone_width_multiplier=0.3):
+    """
+    计算Zone区间
+    区间宽度 = 0.2-0.4 × ATR
+    NQ的ATR通常比ES大3-4倍，Zone宽度会相应更大
+    """
+    atr = df.iloc[idx]['atr']
+    if pd.isna(atr):
+        atr = 80  # NQ默认值（比ES大约3-4倍）
+    
+    zone_width = atr * zone_width_multiplier
+    
+    if is_high:
+        price = df.iloc[idx]['high']
+        zone_top = price + zone_width / 2
+        zone_bottom = price - zone_width / 2
+    else:
+        price = df.iloc[idx]['low']
+        zone_top = price + zone_width / 2
+        zone_bottom = price - zone_width / 2
+    
+    return zone_top, zone_bottom, price
+
+
+def analyze_structures(df):
+    """
+    主分析函数：识别所有合格结构位
+    """
+    # 找候选点
+    swing_highs, swing_lows = find_swing_candidates(df, left_bars=3)
+    
+    structures = []
+    
+    # 分析Swing Highs
+    for idx in swing_highs:
+        # 条件一：方向性延伸
+        valid_extension, move_size = validate_directional_extension(df, idx, is_high=True)
+        if not valid_extension:
+            continue
+        
+        # 条件二：打破前结构
+        valid_break = validate_structure_break(df, swing_highs, swing_lows, idx, is_high=True)
+        if not valid_break:
+            continue
+        
+        # 条件三：波动率扩张
+        has_vol_expansion = check_volatility_expansion(df, idx)
+        
+        # 分级
+        level = classify_structure_level(df, idx, is_high=True, move_size=move_size, has_volatility_expansion=has_vol_expansion)
+        
+        # 计算Zone
+        zone_top, zone_bottom, price = calculate_zone(df, idx, is_high=True)
+        
+        structures.append({
+            'date': df.iloc[idx]['time'],
+            'type': 'resistance',
+            'level': level,
+            'price': price,
+            'zone_top': zone_top,
+            'zone_bottom': zone_bottom,
+            'move_size': move_size,
+            'vol_expansion': has_vol_expansion,
+            'idx': idx
+        })
+    
+    # 分析Swing Lows
+    for idx in swing_lows:
+        # 条件一：方向性延伸
+        valid_extension, move_size = validate_directional_extension(df, idx, is_high=False)
+        if not valid_extension:
+            continue
+        
+        # 条件二：打破前结构
+        valid_break = validate_structure_break(df, swing_highs, swing_lows, idx, is_high=False)
+        if not valid_break:
+            continue
+        
+        # 条件三：波动率扩张
+        has_vol_expansion = check_volatility_expansion(df, idx)
+        
+        # 分级
+        level = classify_structure_level(df, idx, is_high=False, move_size=move_size, has_volatility_expansion=has_vol_expansion)
+        
+        # 计算Zone
+        zone_top, zone_bottom, price = calculate_zone(df, idx, is_high=False)
+        
+        structures.append({
+            'date': df.iloc[idx]['time'],
+            'type': 'support',
+            'level': level,
+            'price': price,
+            'zone_top': zone_top,
+            'zone_bottom': zone_bottom,
+            'move_size': move_size,
+            'vol_expansion': has_vol_expansion,
+            'idx': idx
+        })
+    
+    return pd.DataFrame(structures)
+
+
+def get_active_structures(structures_df, current_price, max_distance_atr=5):
+    """
+    获取当前仍然有效的结构位
+    过滤掉已被突破或距离太远的结构
+    """
+    if structures_df.empty:
+        return pd.DataFrame()
+    
+    active = []
+    
+    for _, row in structures_df.iterrows():
+        if row['type'] == 'resistance':
+            # 阻力位：当前价格应该在其下方
+            if current_price < row['zone_top']:
+                active.append(row)
+        else:
+            # 支撑位：当前价格应该在其上方
+            if current_price > row['zone_bottom']:
+                active.append(row)
+    
+    return pd.DataFrame(active)
+
+
+def format_output(structures_df, current_price):
+    """
+    格式化输出结果
+    """
+    if structures_df.empty:
+        return "未找到有效结构位"
+    
+    # 分离支撑和阻力
+    resistances = structures_df[structures_df['type'] == 'resistance'].sort_values('price', ascending=True)
+    supports = structures_df[structures_df['type'] == 'support'].sort_values('price', ascending=False)
+    
+    output_lines = []
+    output_lines.append(f"当前价格: {current_price:.2f}")
+    output_lines.append("=" * 40)
+    
+    # 阻力位（从近到远）
+    output_lines.append("\n📈 阻力位 (Resistance)")
+    output_lines.append("-" * 40)
+    
+    r1_count = 0
+    r2_count = 0
+    for _, row in resistances.iterrows():
+        level_str = "★一级" if row['level'] == 1 else "二级"
+        vol_str = " [放量]" if row['vol_expansion'] else ""
+        distance = row['price'] - current_price
+        output_lines.append(
+            f"{level_str}: {row['zone_bottom']:.2f} - {row['zone_top']:.2f} "
+            f"(+{distance:.2f}点){vol_str}"
+        )
+        if row['level'] == 1:
+            r1_count += 1
+        else:
+            r2_count += 1
+    
+    # 支撑位（从近到远）
+    output_lines.append("\n📉 支撑位 (Support)")
+    output_lines.append("-" * 40)
+    
+    s1_count = 0
+    s2_count = 0
+    for _, row in supports.iterrows():
+        level_str = "★一级" if row['level'] == 1 else "二级"
+        vol_str = " [放量]" if row['vol_expansion'] else ""
+        distance = current_price - row['price']
+        output_lines.append(
+            f"{level_str}: {row['zone_bottom']:.2f} - {row['zone_top']:.2f} "
+            f"(-{distance:.2f}点){vol_str}"
+        )
+        if row['level'] == 1:
+            s1_count += 1
+        else:
+            s2_count += 1
+    
+    output_lines.append("\n" + "=" * 40)
+    output_lines.append(f"统计: 一级阻力{r1_count}个, 二级阻力{r2_count}个, 一级支撑{s1_count}个, 二级支撑{s2_count}个")
+    
+    return "\n".join(output_lines)
+
+
+def create_chart(df, structures_df, current_price):
+    """
+    创建K线图并标注结构位
+    """
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03,
+                        row_heights=[0.7, 0.3])
+    
+    # K线图
+    fig.add_trace(
+        go.Candlestick(
+            x=df['time'],
+            open=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name='NQ'
+        ),
+        row=1, col=1
+    )
+    
+    # 添加结构Zone
+    for _, row in structures_df.iterrows():
+        color = 'rgba(255, 0, 0, 0.2)' if row['type'] == 'resistance' else 'rgba(0, 255, 0, 0.2)'
+        border_color = 'red' if row['type'] == 'resistance' else 'green'
+        line_width = 2 if row['level'] == 1 else 1
+        
+        # 画Zone区域
+        fig.add_hrect(
+            y0=row['zone_bottom'],
+            y1=row['zone_top'],
+            fillcolor=color,
+            line=dict(color=border_color, width=line_width),
+            row=1, col=1
+        )
+        
+        # 添加标签
+        level_str = "L1" if row['level'] == 1 else "L2"
+        type_str = "R" if row['type'] == 'resistance' else "S"
+        fig.add_annotation(
+            x=df['time'].iloc[-1],
+            y=row['price'],
+            text=f"{type_str}{level_str}: {row['price']:.0f}",
+            showarrow=False,
+            xanchor='left',
+            font=dict(size=10, color=border_color),
+            row=1, col=1
+        )
+    
+    # 当前价格线
+    fig.add_hline(y=current_price, line_dash="dash", line_color="blue",
+                  annotation_text=f"当前: {current_price:.2f}", row=1, col=1)
+    
+    # ATR子图
+    fig.add_trace(
+        go.Scatter(x=df['time'], y=df['atr'], name='ATR(14)', line=dict(color='orange')),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df['time'], y=df['atr_ma'], name='ATR MA(20)', line=dict(color='gray', dash='dash')),
+        row=2, col=1
+    )
+    
+    fig.update_layout(
+        title='NQ 日线结构位分析',
+        xaxis_rangeslider_visible=False,
+        height=800
+    )
+    
+    return fig
+
+
+# ============================================================================
+# Streamlit 界面
+# ============================================================================
+
+st.set_page_config(page_title="NQ结构位分析器", layout="wide")
+
+st.title("📊 NQ 日线结构位分析器")
+st.markdown("""
+基于Swing High/Low识别有效结构位，输出Zone区间供日内交易参考。
+
+**筛选条件：**
+1. 方向性延伸 ≥ 1.5× ATR
+2. 打破前一轮结构形态
+3. 波动率扩张（加分项）
+
+**注意：** NQ的ATR通常是ES的3-4倍，Zone宽度会相应更大。
+""")
+
+# 侧边栏参数
+st.sidebar.header("参数设置")
+left_bars = st.sidebar.slider("Swing检测左侧K线数", 2, 5, 3)
+lookforward = st.sidebar.slider("延伸确认K线数", 3, 7, 5)
+atr_multiplier = st.sidebar.slider("ATR倍数阈值", 1.0, 2.5, 1.5)
+zone_width = st.sidebar.slider("Zone宽度(ATR倍数)", 0.2, 0.5, 0.3)
+
+# 文件上传
+uploaded_file = st.file_uploader("上传NQ日线CSV文件", type=['csv'])
+
+if uploaded_file is not None:
+    # 加载数据
+    df = load_and_prepare_data(uploaded_file)
+    
+    st.success(f"✅ 数据加载成功: {len(df)}个交易日 ({df['time'].min().strftime('%Y-%m-%d')} 至 {df['time'].max().strftime('%Y-%m-%d')})")
+    
+    # 当前价格
+    current_price = df.iloc[-1]['close']
+    
+    # 显示ATR信息
+    current_atr = df.iloc[-1]['atr']
+    st.info(f"📊 当前ATR(14): {current_atr:.2f} 点 | Zone宽度约: {current_atr * zone_width:.2f} 点")
+    
+    # 分析结构
+    with st.spinner("正在分析结构位..."):
+        all_structures = analyze_structures(df)
+        active_structures = get_active_structures(all_structures, current_price)
+    
+    # 显示结果
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("📋 当前有效结构位")
+        output_text = format_output(active_structures, current_price)
+        st.code(output_text, language=None)
+        
+        # TradingView输入格式
+        st.subheader("📝 TradingView快速输入")
+        if not active_structures.empty:
+            tv_lines = []
+            resistances = active_structures[active_structures['type'] == 'resistance'].sort_values('price')
+            supports = active_structures[active_structures['type'] == 'support'].sort_values('price', ascending=False)
+            
+            for i, (_, row) in enumerate(resistances.head(2).iterrows()):
+                tv_lines.append(f"R{i+1}_top = {row['zone_top']:.2f}")
+                tv_lines.append(f"R{i+1}_bottom = {row['zone_bottom']:.2f}")
+            
+            for i, (_, row) in enumerate(supports.head(2).iterrows()):
+                tv_lines.append(f"S{i+1}_top = {row['zone_top']:.2f}")
+                tv_lines.append(f"S{i+1}_bottom = {row['zone_bottom']:.2f}")
+            
+            st.code("\n".join(tv_lines), language=None)
+    
+    with col2:
+        st.subheader("📈 K线图")
+        fig = create_chart(df, active_structures, current_price)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # 详细数据表
+    with st.expander("查看所有检测到的结构位"):
+        if not all_structures.empty:
+            display_df = all_structures.copy()
+            display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
+            display_df['level'] = display_df['level'].map({1: '一级', 2: '二级'})
+            display_df['type'] = display_df['type'].map({'resistance': '阻力', 'support': '支撑'})
+            display_df = display_df[['date', 'type', 'level', 'price', 'zone_top', 'zone_bottom', 'move_size', 'vol_expansion']]
+            display_df.columns = ['日期', '类型', '级别', '价格', 'Zone上沿', 'Zone下沿', '延伸幅度', '放量']
+            st.dataframe(display_df, use_container_width=True)
+        else:
+            st.info("未检测到符合条件的结构位")
+
+else:
+    st.info("👆 请上传TradingView导出的NQ日线CSV文件")
+    
+    st.markdown("""
+    ### 如何导出数据
+    1. 在TradingView打开NQ日线图（NQ1! 或 NQH2025 等）
+    2. 确保时间框架选择 **1D (日线)**
+    3. 图表右上角菜单 → **Export chart data**
+    4. 下载CSV文件并上传到这里
+    
+    ### CSV格式要求
+    ```
+    time,open,high,low,close,Volume
+    2025/6/2,21050.25,21155.50,20950.00,21100.75,234567
+    ...
+    ```
+    
+    ### NQ vs ES 的区别
+    - NQ价格约为ES的3.5倍（21000 vs 6000）
+    - NQ的ATR通常是ES的3-4倍（约80点 vs 20点）
+    - Zone宽度会相应更大
+    """)
+
+    
