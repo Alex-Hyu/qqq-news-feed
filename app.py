@@ -1855,18 +1855,7 @@ if stats:
         *   **统计结论**: 美股大部分时间 (约 60%+) 处于震荡中，单边暴跌或暴涨其实是少数。**日内交易切忌频繁止损去赌突破。**
         """)
 
-"""
-ES/NQ 日线结构位分析器
-根据Swing High/Low筛选条件识别一级和二级结构位
-输出Zone区间供日内交易参考
-"""
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # ============================================================================
 # 产品配置
@@ -2295,11 +2284,11 @@ def create_chart(df, structures_df, current_price, product):
 
 
 # ============================================================================
-# Streamlit 界面
+# Streamlit 界面 - ES/NQ 结构位分析
 # ============================================================================
 
-
-st.title("📊 ES/NQ 日线结构位分析器")
+st.divider()
+st.header("9. 📊 ES/NQ 日线结构位分析器")
 st.markdown("""
 基于Swing High/Low识别有效结构位，输出Zone区间供日内交易参考。
 
@@ -2309,21 +2298,18 @@ st.markdown("""
 3. 波动率扩张（加分项）
 """)
 
-# 侧边栏
-st.sidebar.header("📌 选择产品")
-product = st.sidebar.selectbox(
-    "选择分析的产品",
-    options=['ES', 'NQ'],
-    format_func=lambda x: PRODUCT_CONFIG[x]['name']
-)
-
-st.sidebar.markdown(f"**{PRODUCT_CONFIG[product]['description']}**")
-
-st.sidebar.header("⚙️ 参数设置")
-left_bars = st.sidebar.slider("Swing检测左侧K线数", 2, 5, 3)
-lookforward = st.sidebar.slider("延伸确认K线数", 3, 7, 5)
-atr_multiplier = st.sidebar.slider("ATR倍数阈值", 1.0, 2.5, 1.5)
-zone_width = st.sidebar.slider("Zone宽度(ATR倍数)", 0.2, 0.5, 0.3)
+# ES/NQ 分析器控制 (内置在主区域)
+col_es1, col_es2, col_es3, col_es4, col_es5 = st.columns(5)
+with col_es1:
+    product = st.selectbox("选择产品", options=['ES', 'NQ'], format_func=lambda x: PRODUCT_CONFIG[x]['name'])
+with col_es2:
+    left_bars = st.slider("Swing左侧K线", 2, 5, 3)
+with col_es3:
+    lookforward = st.slider("延伸确认K线", 3, 7, 5)
+with col_es4:
+    atr_multiplier = st.slider("ATR倍数", 1.0, 2.5, 1.5)
+with col_es5:
+    zone_width = st.slider("Zone宽度", 0.2, 0.5, 0.3)
 
 # 获取产品配置
 config = PRODUCT_CONFIG[product]
@@ -2425,7 +2411,7 @@ else:
 # ============================================================================
 
 st.divider()
-st.header("📊 资金轮动趋势评分 (Rotation Score)")
+st.header("10. 📊 资金轮动趋势评分 (Rotation Score)")
 
 st.markdown("""
 <div class="summary-box summary-neutral">
@@ -2842,45 +2828,42 @@ def generate_rotation_export(results: dict, gamma_qqq: dict, gamma_nq: dict, gam
 # UI 部分
 # ============================================================================
 
-# 侧边栏输入
-with st.sidebar:
-    st.divider()
-    st.subheader("📊 Rotation Score 设置")
+# Rotation Score 输入区域 (主区域内)
+with st.expander("⚙️ Rotation Score 设置 & SpotGamma 数据输入", expanded=True):
+    col_price1, col_price2, col_price3 = st.columns([1, 1, 2])
     
-    # 当前价格输入
-    st.markdown("**当前价格：**")
-    col_p1, col_p2 = st.columns(2)
-    with col_p1:
-        input_qqq_price = st.number_input("QQQ", value=622.0, step=0.5, format="%.2f")
-    with col_p2:
-        input_nq_price = st.number_input("NQ", value=25800.0, step=10.0, format="%.2f")
+    with col_price1:
+        st.markdown("**当前价格**")
+        input_qqq_price = st.number_input("QQQ 价格", value=622.0, step=0.5, format="%.2f", key="rot_qqq_price")
+        input_nq_price = st.number_input("NQ 价格", value=25800.0, step=10.0, format="%.2f", key="rot_nq_price")
     
-    st.divider()
-    st.subheader("📈 SpotGamma 数据")
+    with col_price2:
+        st.markdown("**QQQ Gamma**")
+        gamma_qqq_input = st.text_area(
+            "粘贴 QQQ SpotGamma",
+            height=150,
+            placeholder="621  Zero Gamma\n625  Call Wall\n590  Put Wall\nDEX: -1219.8\nGEX: 513",
+            key="gamma_qqq_rot"
+        )
     
-    st.markdown("**QQQ Gamma 数据：**")
-    gamma_qqq_input = st.text_area(
-        "QQQ (粘贴 SpotGamma 数据)",
-        height=120,
-        placeholder="621\tZero Gamma\n625\tCall Wall\n590\tPut Wall\nDEX: -1219.8\nGEX: 513",
-        key="gamma_qqq_rot"
-    )
-    
-    st.markdown("**NQ Gamma 数据：**")
-    gamma_nq_input = st.text_area(
-        "NQ (粘贴 SpotGamma 数据)",
-        height=120,
-        placeholder="25372\tZero Gamma\n25481\tCall Wall\n25131\tPut Wall",
-        key="gamma_nq_rot"
-    )
-    
-    st.markdown("**NDX Gamma 数据：**")
-    gamma_ndx_input = st.text_area(
-        "NDX (粘贴 SpotGamma 数据)",
-        height=120,
-        placeholder="25141\tZero Gamma\n25250\tCall Wall\n24900\tPut Wall\nDEX: -280\nGEX: -254.6",
-        key="gamma_ndx_rot"
-    )
+    with col_price3:
+        col_nq, col_ndx = st.columns(2)
+        with col_nq:
+            st.markdown("**NQ Gamma**")
+            gamma_nq_input = st.text_area(
+                "粘贴 NQ SpotGamma",
+                height=150,
+                placeholder="25372  Zero Gamma\n25481  Call Wall\n25131  Put Wall",
+                key="gamma_nq_rot"
+            )
+        with col_ndx:
+            st.markdown("**NDX Gamma**")
+            gamma_ndx_input = st.text_area(
+                "粘贴 NDX SpotGamma",
+                height=150,
+                placeholder="25141  Zero Gamma\n25250  Call Wall\nDEX: -280  GEX: -254.6",
+                key="gamma_ndx_rot"
+            )
 
 # 解析 Gamma 数据
 gamma_qqq = parse_gamma_input(gamma_qqq_input)
