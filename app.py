@@ -2418,5 +2418,775 @@ else:
     | NQ | 20000-22000 | 60-100点 | ~24点 |
     """)
 
+    # ============================================================================
+# 📊 资金轮动评分系统 (Rotation Score System)
+# 添加到现有 app.py 末尾
+# ============================================================================
+
+st.divider()
+st.header("📊 资金轮动趋势评分 (Rotation Score)")
+
+st.markdown("""
+<div class="summary-box summary-neutral">
+<b>📈 趋势评分系统</b>：基于多因子模型计算市场资金流向，输出 -100 到 +100 的综合评分。
+正值 = Risk-On (进攻)，负值 = Risk-Off (防御)。结合 Gamma 环境使用效果最佳。
+</div>
+""", unsafe_allow_html=True)
+
+# ============================================================================
+# 配置区：因子定义
+# ============================================================================
+
+ROTATION_FACTORS = {
+    'risk_appetite': {
+        'name': '风险偏好',
+        'weight': 0.35,
+        'pairs': [
+            {'name': 'Beta_Trade', 'numerator': 'SPHB', 'denominator': 'SPLV', 'weight': 0.3, 'desc': '高贝塔/低波动'},
+            {'name': 'Growth_Value', 'numerator': 'IWF', 'denominator': 'IWD', 'weight': 0.25, 'desc': '成长/价值'},
+            {'name': 'Credit_Spread', 'numerator': 'HYG', 'denominator': 'IEF', 'weight': 0.25, 'desc': '垃圾债/国债'},
+            {'name': 'Speculative', 'numerator': 'ARKK', 'denominator': 'QQQ', 'weight': 0.2, 'desc': '投机/主流'},
+        ]
+    },
+    'sector_rotation': {
+        'name': '板块轮动',
+        'weight': 0.40,
+        'pairs': [
+            {'name': 'Tech_Staples', 'numerator': 'XLK', 'denominator': 'XLP', 'weight': 0.25, 'desc': '科技/必需'},
+            {'name': 'Semis_Alpha', 'numerator': 'SMH', 'denominator': 'QQQ', 'weight': 0.25, 'desc': '半导体/纳指'},
+            {'name': 'Software_Alpha', 'numerator': 'IGV', 'denominator': 'QQQ', 'weight': 0.20, 'desc': '软件/纳指'},
+            {'name': 'Cyclical_Defensive', 'numerator': 'XLY', 'denominator': 'XLU', 'weight': 0.15, 'desc': '可选/公用'},
+            {'name': 'Financials', 'numerator': 'XLF', 'denominator': 'SPY', 'weight': 0.15, 'desc': '金融/大盘'},
+        ]
+    },
+    'liquidity': {
+        'name': '流动性广度',
+        'weight': 0.25,
+        'pairs': [
+            {'name': 'Small_Large', 'numerator': 'IWM', 'denominator': 'SPY', 'weight': 0.35, 'desc': '小盘/大盘'},
+            {'name': 'Equal_Cap', 'numerator': 'RSP', 'denominator': 'SPY', 'weight': 0.35, 'desc': '等权/市值'},
+            {'name': 'EM_US', 'numerator': 'EEM', 'denominator': 'SPY', 'weight': 0.30, 'desc': '新兴/美股'},
+        ]
+    }
+}
+
+LOOKBACK_PERIOD = 20  # Z-Score 计算窗口
+Z_SCORE_CLIP = 3.0    # 极值处理
+
+# ============================================================================
+# 数据获取函数
+# ============================================================================
+
+@st.cache_data(ttl=3600)  # 缓存1小时
+def get_rotation_data(tickers: list, period: str = "60d") -> pd.DataFrame:
+    """获取所有需要的 ETF 数据"""
+    try:
+        data = yf.download(tickers, period=period, progress=False)['Adj Close']
+        return data
+    except Exception as e:
+        st.error(f"数据获取失败: {e}")
+        return pd.DataFrame()
+
+def calculate_z_score(series: pd.Series, lookback: int = 20) -> float:
+    """计算 Z-Score"""
+    if len(series) < lookback:
+        return 0.0
+    
+    recent = series.iloc[-lookback:]
+    current = series.iloc[-1]
+    mean = recent.mean()
+    std = recent.std()
+    
+    if std == 0:
+        return 0.0
+    
+    z = (current - mean) / std
+    return np.clip(z, -Z_SCORE_CLIP, Z_SCORE_CLIP)
+
+def calculate_ratio_z_score(data: pd.DataFrame, numerator: str, denominator: str, lookback: int = 20) -> tuple:
+    """计算比率的 Z-Score"""
+    if numerator not in data.columns or denominator not in data.columns:
+        return 0.0, 0.0, 0.0
+    
+    ratio = data[numerator] / data[denominator]
+    ratio = ratio.dropna()
+    
+    if len(ratio) < lookback:
+        return 0.0, 0.0, 0.0
+    
+    current_ratio = ratio.iloc[-1]
+    z_score = calculate_z_score(ratio, lookback)
+    
+    # 计算5日变化
+    if len(ratio) >= 5:
+        change_5d = (ratio.iloc[-1] / ratio.iloc[-5] - 1) * 100
+    else:
+        change_5d = 0.0
+    
+    return z_score, current_ratio, change_5d
+
+def calculate_rotation_score(data: pd.DataFrame) -> dict:
+    """计算综合 Rotation Score"""
+    results = {
+        'total_score': 0.0,
+        'categories': {},
+        'factors': [],
+        'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    }
+    
+    total_score = 0.0
+    
+    for cat_key, category in ROTATION_FACTORS.items():
+        cat_score = 0.0
+        cat_factors = []
+        
+        for pair in category['pairs']:
+            z_score, ratio, change_5d = calculate_ratio_z_score(
+                data, pair['numerator'], pair['denominator'], LOOKBACK_PERIOD
+            )
+            
+            weighted_z = z_score * pair['weight']
+            cat_score += weighted_z
+            
+            factor_result = {
+                'name': pair['name'],
+                'desc': pair['desc'],
+                'pair': f"{pair['numerator']}/{pair['denominator']}",
+                'ratio': ratio,
+                'z_score': z_score,
+                'change_5d': change_5d,
+                'weighted': weighted_z,
+                'signal': 'bullish' if z_score > 0.5 else 'bearish' if z_score < -0.5 else 'neutral'
+            }
+            cat_factors.append(factor_result)
+            results['factors'].append(factor_result)
+        
+        # 归一化到 -100 ~ +100
+        cat_normalized = (cat_score / Z_SCORE_CLIP) * 100
+        results['categories'][cat_key] = {
+            'name': category['name'],
+            'score': cat_normalized,
+            'weight': category['weight'],
+            'factors': cat_factors
+        }
+        
+        total_score += cat_normalized * category['weight']
+    
+    results['total_score'] = np.clip(total_score, -100, 100)
+    
+    return results
+
+# ============================================================================
+# Gamma 数据解析
+# ============================================================================
+
+def parse_gamma_input(text: str) -> dict:
+    """解析 SpotGamma 粘贴数据"""
+    result = {
+        'zero_gamma': None,
+        'call_wall': None,
+        'put_wall': None,
+        'vol_trigger': None,
+        'dex': None,
+        'gex': None,
+        'levels': []
+    }
+    
+    if not text or not text.strip():
+        return result
+    
+    lines = text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # 尝试解析 DEX/GEX
+        line_lower = line.lower()
+        if 'dex' in line_lower:
+            try:
+                # 提取数字
+                import re
+                numbers = re.findall(r'-?\d+\.?\d*', line)
+                if numbers:
+                    result['dex'] = float(numbers[0])
+            except:
+                pass
+            continue
+        
+        if 'gex' in line_lower and 'zero' not in line_lower:
+            try:
+                import re
+                numbers = re.findall(r'-?\d+\.?\d*', line)
+                if numbers:
+                    result['gex'] = float(numbers[0])
+            except:
+                pass
+            continue
+        
+        # 解析价位数据 (Tab 或空格分隔)
+        parts = line.replace('\t', ' ').split()
+        if len(parts) >= 2:
+            try:
+                price = float(parts[0].replace(',', ''))
+                level_name = ' '.join(parts[1:]).lower()
+                
+                result['levels'].append({'price': price, 'name': ' '.join(parts[1:])})
+                
+                if 'zero gamma' in level_name:
+                    result['zero_gamma'] = price
+                elif 'call wall' in level_name:
+                    result['call_wall'] = price
+                elif 'put wall' in level_name:
+                    result['put_wall'] = price
+                elif 'vol' in level_name and 'trigger' in level_name:
+                    result['vol_trigger'] = price
+            except ValueError:
+                continue
+    
+    return result
+
+# ============================================================================
+# 策略建议生成
+# ============================================================================
+
+def generate_strategy_recommendation(rotation_score: float, gamma_data: dict, current_price: float = None) -> dict:
+    """基于 Rotation Score 和 Gamma 环境生成策略建议"""
+    
+    rec = {
+        'market_state': '',
+        'gamma_env': '',
+        'strategy': '',
+        'reasoning': [],
+        'risk_level': ''
+    }
+    
+    # 判断 Rotation 状态
+    if rotation_score > 60:
+        rec['market_state'] = '强力进攻 (Strong Risk-On)'
+        rot_bias = 'very_bullish'
+    elif rotation_score > 20:
+        rec['market_state'] = '震荡偏多 (Mild Risk-On)'
+        rot_bias = 'bullish'
+    elif rotation_score > -20:
+        rec['market_state'] = '无序震荡 (Neutral)'
+        rot_bias = 'neutral'
+    elif rotation_score > -60:
+        rec['market_state'] = '避险调整 (Mild Risk-Off)'
+        rot_bias = 'bearish'
+    else:
+        rec['market_state'] = '恐慌抛售 (Strong Risk-Off)'
+        rot_bias = 'very_bearish'
+    
+    # 判断 Gamma 环境
+    gamma_env = 'unknown'
+    if gamma_data.get('zero_gamma') and current_price:
+        if current_price > gamma_data['zero_gamma']:
+            gamma_env = 'positive'
+            rec['gamma_env'] = '正 Gamma (做市商高抛低吸)'
+        else:
+            gamma_env = 'negative'
+            rec['gamma_env'] = '负 Gamma (做市商追涨杀跌)'
+    
+    # 生成策略建议
+    strategy_matrix = {
+        ('very_bullish', 'positive'): {
+            'strategy': 'Bull Call Spread',
+            'reasoning': ['资金强势流入进攻板块', '正 Gamma 压制暴涨，Spread 合适', '目标 Call Wall'],
+            'risk': '中等'
+        },
+        ('very_bullish', 'negative'): {
+            'strategy': 'Long Call',
+            'reasoning': ['资金强势流入', '负 Gamma 可能暴涨', '不限制上涨收益'],
+            'risk': '较高'
+        },
+        ('bullish', 'positive'): {
+            'strategy': 'Bull Call Spread',
+            'reasoning': ['资金偏多', '正 Gamma 震荡上行', '控制成本'],
+            'risk': '中低'
+        },
+        ('bullish', 'negative'): {
+            'strategy': 'Bull Call Spread / Long Call',
+            'reasoning': ['资金偏多', '负 Gamma 波动大', '视风险偏好选择'],
+            'risk': '中高'
+        },
+        ('neutral', 'positive'): {
+            'strategy': 'Iron Condor / 观望',
+            'reasoning': ['资金方向不明', '正 Gamma 震荡', '卖两边收权利金'],
+            'risk': '中等'
+        },
+        ('neutral', 'negative'): {
+            'strategy': 'Long Straddle / 观望',
+            'reasoning': ['方向不明但波动大', '负 Gamma 等突破', '买两边'],
+            'risk': '较高'
+        },
+        ('bearish', 'positive'): {
+            'strategy': 'Bear Put Spread',
+            'reasoning': ['资金流出', '正 Gamma 慢跌', 'Spread 控制成本'],
+            'risk': '中等'
+        },
+        ('bearish', 'negative'): {
+            'strategy': 'Long Put',
+            'reasoning': ['资金流出', '负 Gamma 可能暴跌', '不限制下跌收益'],
+            'risk': '较高'
+        },
+        ('very_bearish', 'positive'): {
+            'strategy': 'Bear Put Spread',
+            'reasoning': ['资金恐慌流出', '但正 Gamma 有支撑', '控制风险'],
+            'risk': '中高'
+        },
+        ('very_bearish', 'negative'): {
+            'strategy': 'Long Put / Long Straddle',
+            'reasoning': ['极度恐慌', '负 Gamma 可能崩盘', '做空或做波动率'],
+            'risk': '高'
+        },
+    }
+    
+    key = (rot_bias, gamma_env)
+    if key in strategy_matrix:
+        rec['strategy'] = strategy_matrix[key]['strategy']
+        rec['reasoning'] = strategy_matrix[key]['reasoning']
+        rec['risk_level'] = strategy_matrix[key]['risk']
+    else:
+        rec['strategy'] = '观望 / 轻仓试探'
+        rec['reasoning'] = ['Gamma 数据不完整', '建议等待更多信息']
+        rec['risk_level'] = '未知'
+    
+    return rec
+
+# ============================================================================
+# 导出函数
+# ============================================================================
+
+def generate_rotation_export(results: dict, gamma_qqq: dict, gamma_nq: dict, gamma_ndx: dict, 
+                            recommendation: dict, current_prices: dict) -> str:
+    """生成 Claude 导出文本"""
+    
+    export_lines = [
+        "# 📊 资金轮动分析报告",
+        f"生成时间: {results['timestamp']}",
+        "",
+        "## 一、综合评分",
+        f"**Rotation Score: {results['total_score']:.1f}** (-100 到 +100)",
+        "",
+    ]
+    
+    # 分类评分
+    export_lines.append("## 二、分类评分")
+    for cat_key, cat_data in results['categories'].items():
+        export_lines.append(f"### {cat_data['name']} (权重 {cat_data['weight']*100:.0f}%)")
+        export_lines.append(f"评分: {cat_data['score']:.1f}")
+        export_lines.append("")
+        for factor in cat_data['factors']:
+            signal_emoji = '🟢' if factor['signal'] == 'bullish' else '🔴' if factor['signal'] == 'bearish' else '⚪'
+            export_lines.append(f"- {signal_emoji} {factor['desc']} ({factor['pair']}): Z={factor['z_score']:.2f}, 5D变化={factor['change_5d']:.2f}%")
+        export_lines.append("")
+    
+    # Gamma 数据
+    export_lines.append("## 三、Gamma 环境")
+    
+    if gamma_qqq.get('zero_gamma'):
+        export_lines.append("### QQQ")
+        export_lines.append(f"- 当前价: ${current_prices.get('QQQ', 'N/A')}")
+        export_lines.append(f"- Zero Gamma: ${gamma_qqq.get('zero_gamma')}")
+        export_lines.append(f"- Call Wall: ${gamma_qqq.get('call_wall')}")
+        export_lines.append(f"- Put Wall: ${gamma_qqq.get('put_wall')}")
+        if gamma_qqq.get('dex'):
+            export_lines.append(f"- DEX: {gamma_qqq.get('dex')}M")
+        if gamma_qqq.get('gex'):
+            export_lines.append(f"- GEX: {gamma_qqq.get('gex')}M")
+        export_lines.append("")
+    
+    if gamma_nq.get('zero_gamma'):
+        export_lines.append("### NQ")
+        export_lines.append(f"- 当前价: {current_prices.get('NQ', 'N/A')}")
+        export_lines.append(f"- Zero Gamma: {gamma_nq.get('zero_gamma')}")
+        export_lines.append(f"- Call Wall: {gamma_nq.get('call_wall')}")
+        export_lines.append(f"- Put Wall: {gamma_nq.get('put_wall')}")
+        export_lines.append("")
+    
+    if gamma_ndx.get('zero_gamma'):
+        export_lines.append("### NDX")
+        export_lines.append(f"- Zero Gamma: {gamma_ndx.get('zero_gamma')}")
+        export_lines.append(f"- Call Wall: {gamma_ndx.get('call_wall')}")
+        export_lines.append(f"- Put Wall: {gamma_ndx.get('put_wall')}")
+        if gamma_ndx.get('dex'):
+            export_lines.append(f"- DEX: {gamma_ndx.get('dex')}M")
+        if gamma_ndx.get('gex'):
+            export_lines.append(f"- GEX: {gamma_ndx.get('gex')}M")
+        export_lines.append("")
+    
+    # 策略建议
+    export_lines.append("## 四、策略建议")
+    export_lines.append(f"- 市场状态: {recommendation['market_state']}")
+    export_lines.append(f"- Gamma 环境: {recommendation['gamma_env']}")
+    export_lines.append(f"- 推荐策略: **{recommendation['strategy']}**")
+    export_lines.append(f"- 风险等级: {recommendation['risk_level']}")
+    export_lines.append("- 理由:")
+    for reason in recommendation['reasoning']:
+        export_lines.append(f"  - {reason}")
+    
+    export_lines.append("")
+    export_lines.append("---")
+    export_lines.append("请基于以上数据进行深度分析:")
+    export_lines.append("1. 资金流向是否支持当前趋势？")
+    export_lines.append("2. 哪些因子是主要驱动力？")
+    export_lines.append("3. Gamma 环境与资金流向是否共振？")
+    export_lines.append("4. 建议的期权策略行权价？")
+    
+    return '\n'.join(export_lines)
+
+# ============================================================================
+# UI 部分
+# ============================================================================
+
+# 侧边栏输入
+with st.sidebar:
+    st.divider()
+    st.subheader("📊 Rotation Score 设置")
+    
+    # 当前价格输入
+    st.markdown("**当前价格：**")
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        input_qqq_price = st.number_input("QQQ", value=622.0, step=0.5, format="%.2f")
+    with col_p2:
+        input_nq_price = st.number_input("NQ", value=25800.0, step=10.0, format="%.2f")
+    
+    st.divider()
+    st.subheader("📈 SpotGamma 数据")
+    
+    st.markdown("**QQQ Gamma 数据：**")
+    gamma_qqq_input = st.text_area(
+        "QQQ (粘贴 SpotGamma 数据)",
+        height=120,
+        placeholder="621\tZero Gamma\n625\tCall Wall\n590\tPut Wall\nDEX: -1219.8\nGEX: 513",
+        key="gamma_qqq_rot"
+    )
+    
+    st.markdown("**NQ Gamma 数据：**")
+    gamma_nq_input = st.text_area(
+        "NQ (粘贴 SpotGamma 数据)",
+        height=120,
+        placeholder="25372\tZero Gamma\n25481\tCall Wall\n25131\tPut Wall",
+        key="gamma_nq_rot"
+    )
+    
+    st.markdown("**NDX Gamma 数据：**")
+    gamma_ndx_input = st.text_area(
+        "NDX (粘贴 SpotGamma 数据)",
+        height=120,
+        placeholder="25141\tZero Gamma\n25250\tCall Wall\n24900\tPut Wall\nDEX: -280\nGEX: -254.6",
+        key="gamma_ndx_rot"
+    )
+
+# 解析 Gamma 数据
+gamma_qqq = parse_gamma_input(gamma_qqq_input)
+gamma_nq = parse_gamma_input(gamma_nq_input)
+gamma_ndx = parse_gamma_input(gamma_ndx_input)
+
+current_prices = {
+    'QQQ': input_qqq_price,
+    'NQ': input_nq_price
+}
+
+# 收集所有需要的 ticker
+all_tickers = set()
+for category in ROTATION_FACTORS.values():
+    for pair in category['pairs']:
+        all_tickers.add(pair['numerator'])
+        all_tickers.add(pair['denominator'])
+
+all_tickers = list(all_tickers)
+
+# 获取数据并计算
+with st.spinner("正在获取 ETF 数据..."):
+    rotation_data = get_rotation_data(all_tickers)
+
+if not rotation_data.empty:
+    results = calculate_rotation_score(rotation_data)
+    
+    # 生成策略建议
+    recommendation = generate_strategy_recommendation(
+        results['total_score'], 
+        gamma_qqq, 
+        input_qqq_price
+    )
+    
+    # ========================================
+    # 主仪表盘
+    # ========================================
+    
+    st.subheader("📈 综合评分仪表盘")
+    
+    col_gauge, col_status = st.columns([2, 1])
+    
+    with col_gauge:
+        # 创建仪表盘
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=results['total_score'],
+            domain={'x': [0, 1], 'y': [0, 1]},
+            title={'text': "Rotation Score", 'font': {'size': 24}},
+            delta={'reference': 0, 'increasing': {'color': "green"}, 'decreasing': {'color': "red"}},
+            gauge={
+                'axis': {'range': [-100, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
+                'bar': {'color': "darkblue"},
+                'bgcolor': "white",
+                'borderwidth': 2,
+                'bordercolor': "gray",
+                'steps': [
+                    {'range': [-100, -60], 'color': '#dc3545'},
+                    {'range': [-60, -20], 'color': '#fd7e14'},
+                    {'range': [-20, 20], 'color': '#ffc107'},
+                    {'range': [20, 60], 'color': '#90EE90'},
+                    {'range': [60, 100], 'color': '#28a745'}
+                ],
+                'threshold': {
+                    'line': {'color': "black", 'width': 4},
+                    'thickness': 0.75,
+                    'value': results['total_score']
+                }
+            }
+        ))
+        
+        fig_gauge.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig_gauge, use_container_width=True)
+    
+    with col_status:
+        # 状态卡片
+        score = results['total_score']
+        if score > 60:
+            status_class = "summary-bull"
+            status_emoji = "🚀"
+            status_text = "强力进攻"
+        elif score > 20:
+            status_class = "summary-bull"
+            status_emoji = "📈"
+            status_text = "震荡偏多"
+        elif score > -20:
+            status_class = "summary-neutral"
+            status_emoji = "⚖️"
+            status_text = "无序震荡"
+        elif score > -60:
+            status_class = "summary-bear"
+            status_emoji = "📉"
+            status_text = "避险调整"
+        else:
+            status_class = "summary-bear"
+            status_emoji = "🔻"
+            status_text = "恐慌抛售"
+        
+        st.markdown(f"""
+        <div class="summary-box {status_class}">
+        <h2>{status_emoji} {status_text}</h2>
+        <p><b>评分：{score:.1f}</b></p>
+        <p>更新时间：{results['timestamp']}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 分类评分
+        st.markdown("**分类评分：**")
+        for cat_key, cat_data in results['categories'].items():
+            cat_score = cat_data['score']
+            color = "green" if cat_score > 10 else "red" if cat_score < -10 else "gray"
+            st.markdown(f"- {cat_data['name']}: <span style='color:{color}'><b>{cat_score:.1f}</b></span>", unsafe_allow_html=True)
+    
+    # ========================================
+    # 因子详情
+    # ========================================
+    
+    st.subheader("📊 因子分解")
+    
+    # 水平条形图
+    factor_names = []
+    factor_zscores = []
+    factor_colors = []
+    
+    for factor in results['factors']:
+        factor_names.append(f"{factor['desc']}")
+        factor_zscores.append(factor['z_score'])
+        factor_colors.append('#28a745' if factor['z_score'] > 0 else '#dc3545')
+    
+    fig_factors = go.Figure()
+    fig_factors.add_trace(go.Bar(
+        y=factor_names,
+        x=factor_zscores,
+        orientation='h',
+        marker_color=factor_colors,
+        text=[f"{z:.2f}" for z in factor_zscores],
+        textposition='outside'
+    ))
+    
+    fig_factors.add_vline(x=0, line_dash="dash", line_color="gray")
+    fig_factors.add_vline(x=0.5, line_dash="dot", line_color="green", opacity=0.5)
+    fig_factors.add_vline(x=-0.5, line_dash="dot", line_color="red", opacity=0.5)
+    
+    fig_factors.update_layout(
+        title="因子 Z-Score (偏离均值程度)",
+        xaxis_title="Z-Score",
+        yaxis_title="",
+        height=400,
+        xaxis=dict(range=[-3.5, 3.5]),
+        showlegend=False
+    )
+    
+    st.plotly_chart(fig_factors, use_container_width=True)
+    
+    # 因子详情表格
+    with st.expander("📋 因子详情表"):
+        factor_df = pd.DataFrame(results['factors'])
+        factor_df = factor_df[['desc', 'pair', 'ratio', 'z_score', 'change_5d', 'signal']]
+        factor_df.columns = ['因子', '比率对', '当前值', 'Z-Score', '5日变化%', '信号']
+        factor_df['当前值'] = factor_df['当前值'].apply(lambda x: f"{x:.4f}" if x else "N/A")
+        factor_df['Z-Score'] = factor_df['Z-Score'].apply(lambda x: f"{x:.2f}")
+        factor_df['5日变化%'] = factor_df['5日变化%'].apply(lambda x: f"{x:.2f}%")
+        factor_df['信号'] = factor_df['信号'].map({'bullish': '🟢 看涨', 'bearish': '🔴 看跌', 'neutral': '⚪ 中性'})
+        st.dataframe(factor_df, use_container_width=True, hide_index=True)
+    
+    # ========================================
+    # Gamma 环境与策略建议
+    # ========================================
+    
+    st.subheader("🎯 Gamma 环境与策略建议")
+    
+    col_gamma, col_strategy = st.columns([1, 1])
+    
+    with col_gamma:
+        st.markdown("**Gamma 关键位：**")
+        
+        # QQQ
+        if gamma_qqq.get('zero_gamma'):
+            qqq_pos = "✅ 正 Gamma" if input_qqq_price > gamma_qqq['zero_gamma'] else "⚠️ 负 Gamma"
+            st.markdown(f"""
+            **QQQ** ${input_qqq_price:.2f} | {qqq_pos}
+            - Zero Gamma: ${gamma_qqq.get('zero_gamma')}
+            - Call Wall: ${gamma_qqq.get('call_wall')}
+            - Put Wall: ${gamma_qqq.get('put_wall')}
+            """)
+            if gamma_qqq.get('dex'):
+                dex_sign = "📈" if gamma_qqq['dex'] > 0 else "📉"
+                st.markdown(f"- DEX: {dex_sign} {gamma_qqq['dex']}M")
+            if gamma_qqq.get('gex'):
+                gex_sign = "🟢" if gamma_qqq['gex'] > 0 else "🔴"
+                st.markdown(f"- GEX: {gex_sign} {gamma_qqq['gex']}M")
+        else:
+            st.info("👈 请在侧边栏粘贴 QQQ Gamma 数据")
+        
+        st.markdown("---")
+        
+        # NQ
+        if gamma_nq.get('zero_gamma'):
+            nq_pos = "✅ 正 Gamma" if input_nq_price > gamma_nq['zero_gamma'] else "⚠️ 负 Gamma"
+            st.markdown(f"""
+            **NQ** {input_nq_price:.2f} | {nq_pos}
+            - Zero Gamma: {gamma_nq.get('zero_gamma')}
+            - Call Wall: {gamma_nq.get('call_wall')}
+            - Put Wall: {gamma_nq.get('put_wall')}
+            """)
+        else:
+            st.info("👈 请在侧边栏粘贴 NQ Gamma 数据")
+    
+    with col_strategy:
+        st.markdown("**📋 策略建议：**")
+        
+        if recommendation['strategy']:
+            risk_color = {
+                '中低': 'green',
+                '中等': 'orange', 
+                '中高': 'darkorange',
+                '较高': 'red',
+                '高': 'darkred'
+            }.get(recommendation['risk_level'], 'gray')
+            
+            st.markdown(f"""
+            <div class="summary-box summary-neutral">
+            <h3>💡 {recommendation['strategy']}</h3>
+            <p><b>市场状态：</b>{recommendation['market_state']}</p>
+            <p><b>Gamma 环境：</b>{recommendation['gamma_env'] or '数据不足'}</p>
+            <p><b>风险等级：</b><span style='color:{risk_color}'>{recommendation['risk_level']}</span></p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("**理由：**")
+            for reason in recommendation['reasoning']:
+                st.markdown(f"- {reason}")
+        else:
+            st.info("请输入 Gamma 数据以获取策略建议")
+    
+    # ========================================
+    # 导出到 Claude
+    # ========================================
+    
+    st.subheader("🤖 导出到 Claude")
+    
+    with st.expander("📋 复制数据到 Claude 进行深度分析", expanded=False):
+        export_text = generate_rotation_export(
+            results, gamma_qqq, gamma_nq, gamma_ndx, 
+            recommendation, current_prices
+        )
+        
+        st.markdown("""
+        <div class="export-box">
+        <p>📋 点击下方文本框，全选 (Ctrl+A) 并复制 (Ctrl+C)，然后粘贴到 Claude</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.text_area("导出数据", export_text, height=400, key="rotation_export")
+
+else:
+    st.error("无法获取 ETF 数据，请检查网络连接")
+
+# ============================================================================
+# 市场广度雷达图 (可选)
+# ============================================================================
+
+with st.expander("📡 市场广度雷达图", expanded=False):
+    # 提取各分类的分数
+    categories = list(results['categories'].keys())
+    cat_scores = [results['categories'][c]['score'] for c in categories]
+    cat_names = [results['categories'][c]['name'] for c in categories]
+    
+    # 闭合雷达图
+    cat_names_closed = cat_names + [cat_names[0]]
+    cat_scores_closed = cat_scores + [cat_scores[0]]
+    
+    fig_radar = go.Figure()
+    
+    fig_radar.add_trace(go.Scatterpolar(
+        r=cat_scores_closed,
+        theta=cat_names_closed,
+        fill='toself',
+        name='当前',
+        line_color='blue'
+    ))
+    
+    # 添加零线
+    fig_radar.add_trace(go.Scatterpolar(
+        r=[0] * len(cat_names_closed),
+        theta=cat_names_closed,
+        mode='lines',
+        line=dict(color='gray', dash='dash'),
+        name='中性线'
+    ))
+    
+    fig_radar.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[-100, 100]
+            )
+        ),
+        showlegend=True,
+        title="资金流向雷达图"
+    )
+    
+    st.plotly_chart(fig_radar, use_container_width=True)
+
+st.divider()
+st.caption("📊 Rotation Score 系统 v1.0 | 数据来源: Yahoo Finance | 仅供参考，不构成投资建议")
+
+
 
     
