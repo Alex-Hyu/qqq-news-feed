@@ -2468,21 +2468,27 @@ Z_SCORE_CLIP = 3.0    # 极值处理
 def get_rotation_data(tickers: list, period: str = "60d") -> pd.DataFrame:
     """获取所有需要的 ETF 数据"""
     try:
-        data = yf.download(tickers, period=period, progress=False, group_by='ticker')
+        data = yf.download(tickers, period=period, progress=False)
         
-        # 处理不同的返回格式
+        # 检查是否为空
+        if data.empty:
+            st.warning("Yahoo Finance 返回空数据")
+            return pd.DataFrame()
+        
+        # 处理 MultiIndex 格式 (新版 yfinance)
+        # Level 0 = 价格类型 (Close, Adj Close, etc.)
+        # Level 1 = Ticker 名称
         if isinstance(data.columns, pd.MultiIndex):
-            # 多 ticker 时返回 MultiIndex，提取 Close 或 Adj Close
-            result = pd.DataFrame()
-            for ticker in tickers:
-                if ticker in data.columns.get_level_values(0):
-                    if 'Adj Close' in data[ticker].columns:
-                        result[ticker] = data[ticker]['Adj Close']
-                    elif 'Close' in data[ticker].columns:
-                        result[ticker] = data[ticker]['Close']
-            return result
+            # 优先使用 Adj Close，否则用 Close
+            if 'Adj Close' in data.columns.get_level_values(0):
+                return data['Adj Close']
+            elif 'Close' in data.columns.get_level_values(0):
+                return data['Close']
+            else:
+                st.warning("数据中没有 Close 或 Adj Close 列")
+                return pd.DataFrame()
         else:
-            # 单 ticker 时返回普通 DataFrame
+            # 单 ticker 或旧版格式
             if 'Adj Close' in data.columns:
                 return data[['Adj Close']].rename(columns={'Adj Close': tickers[0]})
             elif 'Close' in data.columns:
