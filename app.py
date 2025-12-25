@@ -2468,10 +2468,29 @@ Z_SCORE_CLIP = 3.0    # 极值处理
 def get_rotation_data(tickers: list, period: str = "60d") -> pd.DataFrame:
     """获取所有需要的 ETF 数据"""
     try:
-        data = yf.download(tickers, period=period, progress=False)['Adj Close']
-        return data
+        data = yf.download(tickers, period=period, progress=False, group_by='ticker')
+        
+        # 处理不同的返回格式
+        if isinstance(data.columns, pd.MultiIndex):
+            # 多 ticker 时返回 MultiIndex，提取 Close 或 Adj Close
+            result = pd.DataFrame()
+            for ticker in tickers:
+                if ticker in data.columns.get_level_values(0):
+                    if 'Adj Close' in data[ticker].columns:
+                        result[ticker] = data[ticker]['Adj Close']
+                    elif 'Close' in data[ticker].columns:
+                        result[ticker] = data[ticker]['Close']
+            return result
+        else:
+            # 单 ticker 时返回普通 DataFrame
+            if 'Adj Close' in data.columns:
+                return data[['Adj Close']].rename(columns={'Adj Close': tickers[0]})
+            elif 'Close' in data.columns:
+                return data[['Close']].rename(columns={'Close': tickers[0]})
+            return data
+            
     except Exception as e:
-        st.error(f"数据获取失败: {e}")
+        st.warning(f"数据获取失败: {e}")
         return pd.DataFrame()
 
 def calculate_z_score(series: pd.Series, lookback: int = 20) -> float:
@@ -3120,53 +3139,56 @@ if not rotation_data.empty:
         st.text_area("导出数据", export_text, height=400, key="rotation_export")
 
 else:
-    st.error("无法获取 ETF 数据，请检查网络连接")
+    st.warning("⚠️ 无法获取 ETF 数据，请检查网络连接或稍后重试")
+    st.info("💡 如果问题持续，可能是 Yahoo Finance API 暂时不可用")
+    results = None
 
 # ============================================================================
 # 市场广度雷达图 (可选)
 # ============================================================================
 
-with st.expander("📡 市场广度雷达图", expanded=False):
-    # 提取各分类的分数
-    categories = list(results['categories'].keys())
-    cat_scores = [results['categories'][c]['score'] for c in categories]
-    cat_names = [results['categories'][c]['name'] for c in categories]
-    
-    # 闭合雷达图
-    cat_names_closed = cat_names + [cat_names[0]]
-    cat_scores_closed = cat_scores + [cat_scores[0]]
-    
-    fig_radar = go.Figure()
-    
-    fig_radar.add_trace(go.Scatterpolar(
-        r=cat_scores_closed,
-        theta=cat_names_closed,
-        fill='toself',
-        name='当前',
-        line_color='blue'
-    ))
-    
-    # 添加零线
-    fig_radar.add_trace(go.Scatterpolar(
-        r=[0] * len(cat_names_closed),
-        theta=cat_names_closed,
-        mode='lines',
-        line=dict(color='gray', dash='dash'),
-        name='中性线'
-    ))
-    
-    fig_radar.update_layout(
-        polar=dict(
-            radialaxis=dict(
-                visible=True,
-                range=[-100, 100]
-            )
-        ),
-        showlegend=True,
-        title="资金流向雷达图"
-    )
-    
-    st.plotly_chart(fig_radar, use_container_width=True)
+if results is not None and 'categories' in results:
+    with st.expander("📡 市场广度雷达图", expanded=False):
+        # 提取各分类的分数
+        categories = list(results['categories'].keys())
+        cat_scores = [results['categories'][c]['score'] for c in categories]
+        cat_names = [results['categories'][c]['name'] for c in categories]
+        
+        # 闭合雷达图
+        cat_names_closed = cat_names + [cat_names[0]]
+        cat_scores_closed = cat_scores + [cat_scores[0]]
+        
+        fig_radar = go.Figure()
+        
+        fig_radar.add_trace(go.Scatterpolar(
+            r=cat_scores_closed,
+            theta=cat_names_closed,
+            fill='toself',
+            name='当前',
+            line_color='blue'
+        ))
+        
+        # 添加零线
+        fig_radar.add_trace(go.Scatterpolar(
+            r=[0] * len(cat_names_closed),
+            theta=cat_names_closed,
+            mode='lines',
+            line=dict(color='gray', dash='dash'),
+            name='中性线'
+        ))
+        
+        fig_radar.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[-100, 100]
+                )
+            ),
+            showlegend=True,
+            title="资金流向雷达图"
+        )
+        
+        st.plotly_chart(fig_radar, use_container_width=True)
 
 st.divider()
 st.caption("📊 Rotation Score 系统 v1.0 | 数据来源: Yahoo Finance | 仅供参考，不构成投资建议")
