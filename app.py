@@ -1243,77 +1243,7 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     if not flags: flags.append("暂无显著异常指标")
     return final_score, flags, summary, action
 
-# ============================================================
-# 7. 生成导出到 Claude 的文本
-# ============================================================
 
-def generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news):
-    """生成可复制到 Claude 进行深度分析的文本"""
-    
-    export_text = f"""# 宏观战情室数据快照
-生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST
-
-## 一、流动性指标
-- SOFR: {ny_fed['SOFR']:.2f}%
-- Repo (TGCR): {ny_fed['TGCR']:.2f}%
-- SOFR-Repo 利差: {(ny_fed['SOFR'] - ny_fed['TGCR']):.3f}%
-- RRP: ${fed_liq['RRP']:.0f}B (日变化: {fed_liq['RRP_Chg']:.0f}B)
-- TGA: ${fed_liq['TGA']:.0f}B (日变化: {fed_liq['TGA_Chg']:.0f}B)
-- HYG/LQD: {credit[0]:.3f} (日变化: {credit[1]:.2f}%)
-
-## 二、美债与汇率
-- 10Y 收益率: {rates['Yield_10Y']:.2f}%
-- 3M 收益率: {rates['Yield_Short']:.2f}%
-- 10Y-3M 利差: {rates['Inversion']:.2f}%
-- MOVE 指数: {rates['MOVE']:.1f}
-- DXY: {rates['DXY']:.2f}
-- USDJPY: {rates['USDJPY']:.2f}
-
-## 三、恐慌与情绪
-- VIX: {vol['VIX']:.2f}
-- 币圈恐慌贪婪: {vol['Crypto_Val']} ({vol['Crypto_Text']})
-- PCR: {opt['PCR']:.2f}
-
-## 四、交易微观结构
-- 期货基差: {deriv['Futures_Basis']:.1f} ({deriv['Basis_Status']})
-- Gamma 环境: {deriv['GEX_Net']}
-- Vanna 状态: {deriv['Vanna_Status']}
-- Put Wall: ${deriv['Put_Wall']:.0f}
-- Call Wall: ${deriv['Call_Wall']:.0f}
-
-## 五、GEX 分析
-- 当前价格: ${gex_data['spot_price']:.2f}
-- 净 GEX: {gex_data['total_gex']:.2f}B
-- Gamma Flip Point: ${gex_data['gamma_flip']:.2f}
-- Max Pain: ${gex_data['max_pain']:.2f}
-- GEX Put Wall: ${gex_data['put_wall']:.2f}
-- GEX Call Wall: ${gex_data['call_wall']:.2f}
-
-## 六、规则引擎信号
-市场状态: {regime_analysis['regime'].upper()}
-综合评分: {regime_analysis['score']:.1f}
-
-关键信号:
-"""
-    
-    for sig in regime_analysis['signals']:
-        export_text += f"- [{sig['level']}] {sig['msg']}\n"
-    
-    export_text += "\n## 七、重点新闻\n"
-    for item in processed_news[:10]:
-        cats = ", ".join(item.get('Categories', ['general']))
-        export_text += f"- [{cats}] {item['Title']} (重要性: {item.get('Importance', 0)})\n"
-    
-    export_text += """
----
-请基于以上数据进行深度分析:
-1. 当前市场处于什么宏观周期？
-2. 流动性环境对风险资产的影响？
-3. 有哪些潜在的风险点？
-4. 今日交易的最佳策略是什么？
-"""
-    
-    return export_text
 
 # ============================================================
 # 8. 历史统计 (保留原有)
