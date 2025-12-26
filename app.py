@@ -1661,17 +1661,7 @@ for category, signals in signal_categories.items():
     col_idx += 1
 
 st.markdown("---")
-with st.expander("🤖 导出到 Claude 进行深度分析", expanded=False):
-    export_text = generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news)
-    
-    st.markdown("""
-    <div class="export-box">
-    <p>📋 点击下方按钮复制所有数据，然后粘贴到 Claude 进行深度分析</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.text_area("数据快照 (可复制)", export_text, height=400)
-    st.caption("💡 提示: 全选文本框内容 (Ctrl+A)，复制 (Ctrl+C)，然后粘贴到 Claude 对话中")
+# [导出功能已移至页面底部]
 
 st.divider()
 
@@ -2866,34 +2856,79 @@ with st.expander("⚙️ Rotation Score 设置 & SpotGamma 数据输入", expand
         st.markdown("**QQQ Gamma**")
         gamma_qqq_input = st.text_area(
             "粘贴 QQQ SpotGamma",
-            height=150,
+            height=180,
             placeholder="621  Zero Gamma\n625  Call Wall\n590  Put Wall\nDEX: -1219.8\nGEX: 513",
             key="gamma_qqq_rot"
         )
     
     with col_price3:
-        col_nq, col_ndx = st.columns(2)
-        with col_nq:
-            st.markdown("**NQ Gamma**")
-            gamma_nq_input = st.text_area(
-                "粘贴 NQ SpotGamma",
-                height=150,
-                placeholder="25372  Zero Gamma\n25481  Call Wall\n25131  Put Wall",
-                key="gamma_nq_rot"
-            )
-        with col_ndx:
-            st.markdown("**NDX Gamma**")
-            gamma_ndx_input = st.text_area(
-                "粘贴 NDX SpotGamma",
-                height=150,
-                placeholder="25141  Zero Gamma\n25250  Call Wall\nDEX: -280  GEX: -254.6",
-                key="gamma_ndx_rot"
-            )
+        st.markdown("**NQ/NDX Gamma (三列格式)**")
+        gamma_nq_ndx_input = st.text_area(
+            "粘贴 NQ/NDX SpotGamma",
+            height=180,
+            placeholder="NDX      /NQ      Level ID\n25480    25718    Large Gamma 4\n25470    25708    Call Wall\n25250    25488    Large Gamma 1\n25170    25408    Volatility Trigger\n25150    25388    Put Wall\n25092    25330    Zero Gamma",
+            key="gamma_nq_ndx_rot"
+        )
+        st.caption("格式: NDX [Tab/空格] NQ [Tab/空格] Level ID")
 
 # 解析 Gamma 数据
 gamma_qqq = parse_gamma_input(gamma_qqq_input)
-gamma_nq = parse_gamma_input(gamma_nq_input)
-gamma_ndx = parse_gamma_input(gamma_ndx_input)
+
+# 解析 NQ/NDX 合并格式
+def parse_nq_ndx_combined(text: str) -> tuple:
+    """解析 NQ/NDX 三列格式数据"""
+    result_nq = {
+        'zero_gamma': None, 'call_wall': None, 'put_wall': None,
+        'vol_trigger': None, 'levels': []
+    }
+    result_ndx = {
+        'zero_gamma': None, 'call_wall': None, 'put_wall': None,
+        'vol_trigger': None, 'levels': []
+    }
+    
+    if not text or not text.strip():
+        return result_nq, result_ndx
+    
+    lines = text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line or 'NDX' in line.upper() and '/NQ' in line.upper():  # 跳过标题行
+            continue
+        
+        # 分割行 (Tab 或多空格)
+        import re
+        parts = re.split(r'\t+|\s{2,}', line)
+        
+        if len(parts) >= 3:
+            try:
+                ndx_price = float(parts[0].replace(',', ''))
+                nq_price = float(parts[1].replace(',', '').replace('/',''))
+                level_name = ' '.join(parts[2:]).lower()
+                
+                # 存储到对应的结果
+                result_ndx['levels'].append({'price': ndx_price, 'name': parts[2]})
+                result_nq['levels'].append({'price': nq_price, 'name': parts[2]})
+                
+                # 识别关键位置
+                if 'zero gamma' in level_name:
+                    result_ndx['zero_gamma'] = ndx_price
+                    result_nq['zero_gamma'] = nq_price
+                elif 'call wall' in level_name:
+                    result_ndx['call_wall'] = ndx_price
+                    result_nq['call_wall'] = nq_price
+                elif 'put wall' in level_name:
+                    result_ndx['put_wall'] = ndx_price
+                    result_nq['put_wall'] = nq_price
+                elif 'vol' in level_name and 'trigger' in level_name:
+                    result_ndx['vol_trigger'] = ndx_price
+                    result_nq['vol_trigger'] = nq_price
+            except ValueError:
+                continue
+    
+    return result_nq, result_ndx
+
+gamma_nq, gamma_ndx = parse_nq_ndx_combined(gamma_nq_ndx_input)
 
 # 存储到 session_state 供导出使用
 st.session_state['gamma_qqq_data'] = gamma_qqq
