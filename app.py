@@ -1243,7 +1243,77 @@ def calculate_macro_score(ny_fed, fed_liq, credit, rates, vol, opt, deriv, news_
     if not flags: flags.append("暂无显著异常指标")
     return final_score, flags, summary, action
 
+# ============================================================
+# 7. 生成导出到 Claude 的文本
+# ============================================================
 
+def generate_claude_export(ny_fed, fed_liq, credit, rates, vol, opt, deriv, gex_data, regime_analysis, processed_news):
+    """生成可复制到 Claude 进行深度分析的文本"""
+    
+    export_text = f"""# 宏观战情室数据快照
+生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} EST
+
+## 一、流动性指标
+- SOFR: {ny_fed['SOFR']:.2f}%
+- Repo (TGCR): {ny_fed['TGCR']:.2f}%
+- SOFR-Repo 利差: {(ny_fed['SOFR'] - ny_fed['TGCR']):.3f}%
+- RRP: ${fed_liq['RRP']:.0f}B (日变化: {fed_liq['RRP_Chg']:.0f}B)
+- TGA: ${fed_liq['TGA']:.0f}B (日变化: {fed_liq['TGA_Chg']:.0f}B)
+- HYG/LQD: {credit[0]:.3f} (日变化: {credit[1]:.2f}%)
+
+## 二、美债与汇率
+- 10Y 收益率: {rates['Yield_10Y']:.2f}%
+- 3M 收益率: {rates['Yield_Short']:.2f}%
+- 10Y-3M 利差: {rates['Inversion']:.2f}%
+- MOVE 指数: {rates['MOVE']:.1f}
+- DXY: {rates['DXY']:.2f}
+- USDJPY: {rates['USDJPY']:.2f}
+
+## 三、恐慌与情绪
+- VIX: {vol['VIX']:.2f}
+- 币圈恐慌贪婪: {vol['Crypto_Val']} ({vol['Crypto_Text']})
+- PCR: {opt['PCR']:.2f}
+
+## 四、交易微观结构
+- 期货基差: {deriv['Futures_Basis']:.1f} ({deriv['Basis_Status']})
+- Gamma 环境: {deriv['GEX_Net']}
+- Vanna 状态: {deriv['Vanna_Status']}
+- Put Wall: ${deriv['Put_Wall']:.0f}
+- Call Wall: ${deriv['Call_Wall']:.0f}
+
+## 五、GEX 分析
+- 当前价格: ${gex_data['spot_price']:.2f}
+- 净 GEX: {gex_data['total_gex']:.2f}B
+- Gamma Flip Point: ${gex_data['gamma_flip']:.2f}
+- Max Pain: ${gex_data['max_pain']:.2f}
+- GEX Put Wall: ${gex_data['put_wall']:.2f}
+- GEX Call Wall: ${gex_data['call_wall']:.2f}
+
+## 六、规则引擎信号
+市场状态: {regime_analysis['regime'].upper()}
+综合评分: {regime_analysis['score']:.1f}
+
+关键信号:
+"""
+    
+    for sig in regime_analysis['signals']:
+        export_text += f"- [{sig['level']}] {sig['msg']}\n"
+    
+    export_text += "\n## 七、重点新闻\n"
+    for item in processed_news[:10]:
+        cats = ", ".join(item.get('Categories', ['general']))
+        export_text += f"- [{cats}] {item['Title']} (重要性: {item.get('Importance', 0)})\n"
+    
+    export_text += """
+---
+请基于以上数据进行深度分析:
+1. 当前市场处于什么宏观周期？
+2. 流动性环境对风险资产的影响？
+3. 有哪些潜在的风险点？
+4. 今日交易的最佳策略是什么？
+"""
+    
+    return export_text
 
 # ============================================================
 # 8. 历史统计 (保留原有)
@@ -2796,10 +2866,10 @@ with st.expander("⚙️ Rotation Score 设置 & SpotGamma 数据输入", expand
         gamma_nq_ndx_input = st.text_area(
             "粘贴 NQ/NDX SpotGamma",
             height=180,
-            placeholder="NDX      /NQ      Level ID\n25480    25718    Large Gamma 4\n25470    25708    Call Wall\n25250    25488    Large Gamma 1\n25170    25408    Volatility Trigger\n25150    25388    Put Wall\n25092    25330    Zero Gamma",
+            placeholder="NDX\t/NQ\tLevel ID\n25480\t25718\tLarge Gamma 4\n25470\t25708\tCall Wall\n25170\t25408\tVolatility Trigger\n25150\t25388\tPut Wall\n25092\t25330\tZero Gamma",
             key="gamma_nq_ndx_rot"
         )
-        st.caption("格式: NDX [Tab/空格] NQ [Tab/空格] Level ID")
+        st.caption("第一列=NDX，第二列=NQ，第三列=Level名称")
 
 # 解析 Gamma 数据
 gamma_qqq = parse_gamma_input(gamma_qqq_input)
@@ -3365,14 +3435,50 @@ def generate_unified_export():
 ## 九、SpotGamma 数据 (手动输入)
 ═══════════════════════════════════════════════════════════════
 """
+    has_gamma_data = False
+    
+    # QQQ Gamma
     if 'gamma_qqq_data' in st.session_state and st.session_state['gamma_qqq_data'].get('zero_gamma'):
         g = st.session_state['gamma_qqq_data']
-        export += f"**QQQ**\n"
+        export += f"**QQQ Gamma:**\n"
         export += f"- Zero Gamma: ${g.get('zero_gamma')}\n"
         export += f"- Call Wall: ${g.get('call_wall')}\n"
         export += f"- Put Wall: ${g.get('put_wall')}\n"
-    else:
-        export += "(请在侧边栏输入 SpotGamma 数据)\n"
+        if g.get('vol_trigger'):
+            export += f"- Vol Trigger: ${g.get('vol_trigger')}\n"
+        if g.get('dex'):
+            export += f"- DEX: {g.get('dex')}M\n"
+        if g.get('gex'):
+            export += f"- GEX: {g.get('gex')}M\n"
+        export += "\n"
+        has_gamma_data = True
+    
+    # NQ Gamma
+    if 'gamma_nq_data' in st.session_state and st.session_state['gamma_nq_data'].get('zero_gamma'):
+        g = st.session_state['gamma_nq_data']
+        export += f"**NQ Gamma:**\n"
+        export += f"- Zero Gamma: {g.get('zero_gamma')}\n"
+        export += f"- Call Wall: {g.get('call_wall')}\n"
+        export += f"- Put Wall: {g.get('put_wall')}\n"
+        if g.get('vol_trigger'):
+            export += f"- Vol Trigger: {g.get('vol_trigger')}\n"
+        export += "\n"
+        has_gamma_data = True
+    
+    # NDX Gamma
+    if 'gamma_ndx_data' in st.session_state and st.session_state['gamma_ndx_data'].get('zero_gamma'):
+        g = st.session_state['gamma_ndx_data']
+        export += f"**NDX Gamma:**\n"
+        export += f"- Zero Gamma: {g.get('zero_gamma')}\n"
+        export += f"- Call Wall: {g.get('call_wall')}\n"
+        export += f"- Put Wall: {g.get('put_wall')}\n"
+        if g.get('vol_trigger'):
+            export += f"- Vol Trigger: {g.get('vol_trigger')}\n"
+        export += "\n"
+        has_gamma_data = True
+    
+    if not has_gamma_data:
+        export += "(请在 Rotation Score 设置区域输入 SpotGamma 数据)\n"
     
     # 添加 ETF 扫描结果
     export += """
