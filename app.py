@@ -3200,23 +3200,26 @@ st.divider()
 st.caption("📊 Rotation Score 系统 v1.0 | 数据来源: Yahoo Finance | 仅供参考，不构成投资建议")
 
 
-"""
-ETF板块资金流入扫描器
-用于识别哪些板块正在吸引资金流入
 
-资金流入信号定义：
-1. 价格 > SMA20 (趋势向上)
-2. 成交量 > 成交量SMA20 (放量)
-3. OBV趋势上升 (资金净流入)
-4. 相对强度评分
+"""
+ETF板块资金流入扫描器 - Streamlit版
+运行方式: streamlit run etf_flow_app.py
 """
 
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
+
+# 页面配置
+st.set_page_config(
+    page_title="ETF板块资金流入扫描器",
+    page_icon="📊",
+    layout="wide"
+)
 
 # 核心板块ETF列表
 SECTOR_ETFS = {
@@ -3240,18 +3243,25 @@ SECTOR_ETFS = {
     'DIA': '道指30',
 }
 
-def calculate_signals(ticker: str, period: str = "3mo") -> dict:
-    """
-    计算单个ETF的资金流入信号
-    """
+
+@st.cache_data(ttl=300)  # 缓存5分钟
+def get_etf_data(ticker: str, period: str = "3mo"):
+    """获取ETF数据"""
     try:
-        # 获取数据
         data = yf.download(ticker, period=period, progress=False)
-        
-        if data.empty or len(data) < 25:
+        return data
+    except Exception as e:
+        st.error(f"获取 {ticker} 失败: {e}")
+        return None
+
+
+def calculate_signals(ticker: str, data: pd.DataFrame) -> dict:
+    """计算单个ETF的资金流入信号"""
+    try:
+        if data is None or data.empty or len(data) < 25:
             return None
         
-        # 处理MultiIndex columns (yfinance有时返回这种格式)
+        # 处理MultiIndex columns
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         
@@ -3264,7 +3274,6 @@ def calculate_signals(ticker: str, period: str = "3mo") -> dict:
         
         # OBV计算
         df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
-        df['OBV_SMA5'] = df['OBV'].rolling(5).mean()
         
         # 取最新数据
         latest = df.iloc[-1]
@@ -3303,111 +3312,132 @@ def calculate_signals(ticker: str, period: str = "3mo") -> dict:
         if returns_20d > 0: score += 1
         
         return {
-            'ticker': ticker,
-            'name': SECTOR_ETFS.get(ticker, ticker),
-            'close': round(close, 2),
-            'price_vs_sma20': '✅' if price_above_sma20 else '❌',
-            'price_vs_sma50': '✅' if price_above_sma50 else '❌',
-            'volume_expand': '✅' if volume_expanding else '❌',
-            'obv_rising': '✅' if obv_rising else '❌',
-            'vol_ratio': round(vol_ratio, 2),
-            'dist_sma20_pct': round(dist_from_sma20, 2),
-            'returns_20d': round(returns_20d, 2),
-            'score': score,
+            'ETF': ticker,
+            '板块': SECTOR_ETFS.get(ticker, ticker),
+            '价格': round(close, 2),
+            '>SMA20': '✅' if price_above_sma20 else '❌',
+            '>SMA50': '✅' if price_above_sma50 else '❌',
+            '放量': '✅' if volume_expanding else '❌',
+            'OBV↑': '✅' if obv_rising else '❌',
+            '量比': round(vol_ratio, 2),
+            '距SMA20%': round(dist_from_sma20, 2),
+            '20日涨幅%': round(returns_20d, 2),
+            '评分': score,
         }
         
     except Exception as e:
-        print(f"Error processing {ticker}: {e}")
         return None
-
-
-def scan_all_etfs():
-    """
-    扫描所有板块ETF
-    """
-    print("="*70)
-    print("ETF板块资金流入扫描器")
-    print(f"扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("="*70)
-    print("\n正在获取数据...\n")
-    
-    results = []
-    
-    for ticker in SECTOR_ETFS.keys():
-        result = calculate_signals(ticker)
-        if result:
-            results.append(result)
-    
-    if not results:
-        print("未获取到有效数据")
-        return None
-    
-    # 转换为DataFrame并按评分排序
-    df = pd.DataFrame(results)
-    df = df.sort_values('score', ascending=False)
-    
-    return df
-
-
-def print_report(df: pd.DataFrame):
-    """
-    打印分析报告
-    """
-    print("\n" + "="*70)
-    print("【资金流入评分排名】(5分最高)")
-    print("="*70)
-    
-    # 打印表头
-    print(f"\n{'ETF':<6} {'板块':<12} {'价格':>8} {'>SMA20':>7} {'>SMA50':>7} {'放量':>5} {'OBV↑':>5} {'量比':>6} {'20日涨幅':>9} {'评分':>5}")
-    print("-"*80)
-    
-    for _, row in df.iterrows():
-        print(f"{row['ticker']:<6} {row['name']:<12} {row['close']:>8.2f} {row['price_vs_sma20']:>7} {row['price_vs_sma50']:>7} {row['volume_expand']:>5} {row['obv_rising']:>5} {row['vol_ratio']:>6.2f} {row['returns_20d']:>8.2f}% {row['score']:>5}")
-    
-    # 资金流入板块总结
-    print("\n" + "="*70)
-    print("【资金流入板块】(评分≥4)")
-    print("="*70)
-    
-    inflow = df[df['score'] >= 4]
-    if len(inflow) > 0:
-        for _, row in inflow.iterrows():
-            status = "🔥强势" if row['score'] == 5 else "✅流入"
-            print(f"  {status} {row['ticker']} ({row['name']}): 20日涨幅 {row['returns_20d']}%, 距SMA20 {row['dist_sma20_pct']}%")
-    else:
-        print("  当前无明显资金流入板块")
-    
-    # 资金流出板块
-    print("\n" + "="*70)
-    print("【资金流出/弱势板块】(评分≤2)")
-    print("="*70)
-    
-    outflow = df[df['score'] <= 2]
-    if len(outflow) > 0:
-        for _, row in outflow.iterrows():
-            print(f"  ⚠️ {row['ticker']} ({row['name']}): 20日涨幅 {row['returns_20d']}%")
-    else:
-        print("  当前无明显资金流出板块")
-    
-    return df
 
 
 def main():
-    df = scan_all_etfs()
-    if df is not None:
-        print_report(df)
-        
-        # 保存结果
-        output_file = '/mnt/user-data/outputs/etf_flow_report.csv'
-        df.to_csv(output_file, index=False)
-        print(f"\n📁 详细数据已保存至: {output_file}")
+    st.title("📊 ETF板块资金流入扫描器")
+    st.caption(f"扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
-    return df
+    # 侧边栏设置
+    with st.sidebar:
+        st.header("⚙️ 设置")
+        min_score = st.slider("最低评分筛选", 0, 5, 4)
+        
+        st.markdown("---")
+        st.markdown("""
+        **评分标准 (满分5分):**
+        - 价格 > SMA20 (+1)
+        - 价格 > SMA50 (+1)
+        - 成交量放大 (+1)
+        - OBV上升 (+1)
+        - 20日涨幅 > 0 (+1)
+        """)
+    
+    # 扫描按钮
+    if st.button("🔍 开始扫描", type="primary", use_container_width=True):
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        results = []
+        etf_list = list(SECTOR_ETFS.keys())
+        
+        for i, ticker in enumerate(etf_list):
+            status_text.text(f"正在获取 {ticker} ({SECTOR_ETFS[ticker]})...")
+            progress_bar.progress((i + 1) / len(etf_list))
+            
+            data = get_etf_data(ticker)
+            if data is not None and not data.empty:
+                result = calculate_signals(ticker, data)
+                if result:
+                    results.append(result)
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        if results:
+            df = pd.DataFrame(results)
+            df = df.sort_values('评分', ascending=False)
+            
+            # 显示完整排名
+            st.subheader("📋 全部ETF评分排名")
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+            
+            # 资金流入板块
+            st.subheader(f"🔥 资金流入板块 (评分≥{min_score})")
+            inflow_df = df[df['评分'] >= min_score]
+            
+            if len(inflow_df) > 0:
+                cols = st.columns(len(inflow_df))
+                for i, (_, row) in enumerate(inflow_df.iterrows()):
+                    with cols[i]:
+                        status = "🔥" if row['评分'] == 5 else "✅"
+                        st.metric(
+                            label=f"{status} {row['ETF']}",
+                            value=f"{row['板块']}",
+                            delta=f"{row['20日涨幅%']}%"
+                        )
+            else:
+                st.warning("当前无明显资金流入板块")
+            
+            # 资金流出板块
+            st.subheader("⚠️ 弱势板块 (评分≤2)")
+            outflow_df = df[df['评分'] <= 2]
+            
+            if len(outflow_df) > 0:
+                for _, row in outflow_df.iterrows():
+                    st.write(f"⚠️ **{row['ETF']}** ({row['板块']}): 20日涨幅 {row['20日涨幅%']}%")
+            else:
+                st.success("当前无明显弱势板块")
+            
+            # 下载按钮
+            st.download_button(
+                label="📥 下载CSV",
+                data=df.to_csv(index=False).encode('utf-8-sig'),
+                file_name=f"etf_flow_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.error("未获取到有效数据，请检查网络连接")
+    
+    # 使用说明
+    with st.expander("📖 使用说明"):
+        st.markdown("""
+        **操作流程:**
+        1. 点击「开始扫描」获取最新数据
+        2. 查看评分≥4的板块 = 资金正在流入
+        3. 从你筛选的21只股票中，选择属于这些板块的
+        4. 再用SpotGamma Squeeze名单做最后确认
+        
+        **指标说明:**
+        - **量比**: 今日成交量 / 20日平均成交量
+        - **距SMA20%**: 当前价格偏离SMA20的百分比
+        - **OBV↑**: On-Balance Volume是否上升（资金净流入）
+        """)
 
 
 if __name__ == "__main__":
     main()
-
 
 
     
