@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # --- 0. 全局配置 ---
-st.set_page_config(page_title="QQQ 宏观战情室 Pro Max", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="宏观战情观察室", layout="wide", page_icon="🦅")
 
 st.markdown("""
     <style>
@@ -1423,7 +1423,7 @@ with st.spinner("正在聚合全市场数据..."):
 # ============================================================
 # HEADER
 # ============================================================
-st.title("🦅 QQQ 宏观战情室 Pro Max")
+st.title("🦅 宏观战情观察室")
 current_time = datetime.datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M EST')
 st.caption(f"Update: {current_time}")
 
@@ -2895,6 +2895,11 @@ gamma_qqq = parse_gamma_input(gamma_qqq_input)
 gamma_nq = parse_gamma_input(gamma_nq_input)
 gamma_ndx = parse_gamma_input(gamma_ndx_input)
 
+# 存储到 session_state 供导出使用
+st.session_state['gamma_qqq_data'] = gamma_qqq
+st.session_state['gamma_nq_data'] = gamma_nq
+st.session_state['gamma_ndx_data'] = gamma_ndx
+
 current_prices = {
     'QQQ': input_qqq_price,
     'NQ': input_nq_price
@@ -2915,6 +2920,7 @@ with st.spinner("正在获取 ETF 数据..."):
 
 if not rotation_data.empty:
     results = calculate_rotation_score(rotation_data)
+    st.session_state['rotation_results'] = results  # 存储到 session_state 供导出使用
     
     # 生成策略建议
     recommendation = generate_strategy_recommendation(
@@ -3124,25 +3130,7 @@ if not rotation_data.empty:
         else:
             st.info("请输入 Gamma 数据以获取策略建议")
     
-    # ========================================
-    # 导出到 Claude
-    # ========================================
-    
-    st.subheader("🤖 导出到 Claude")
-    
-    with st.expander("📋 复制数据到 Claude 进行深度分析", expanded=False):
-        export_text = generate_rotation_export(
-            results, gamma_qqq, gamma_nq, gamma_ndx, 
-            recommendation, current_prices
-        )
-        
-        st.markdown("""
-        <div class="export-box">
-        <p>📋 点击下方文本框，全选 (Ctrl+A) 并复制 (Ctrl+C)，然后粘贴到 Claude</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.text_area("导出数据", export_text, height=400, key="rotation_export")
+    # [已移至页面底部统一导出]
 
 else:
     st.warning("⚠️ 无法获取 ETF 数据，请检查网络连接或稍后重试")
@@ -3200,244 +3188,264 @@ st.divider()
 st.caption("📊 Rotation Score 系统 v1.0 | 数据来源: Yahoo Finance | 仅供参考，不构成投资建议")
 
 
+# ============================================================================
+# 11. 📊 ETF 板块资金流入扫描
+# ============================================================================
 
-"""
-ETF板块资金流入扫描器 - Streamlit版
-运行方式: streamlit run etf_flow_app.py
-"""
-
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime
-import warnings
-warnings.filterwarnings('ignore')
-
-# 页面配置
-st.set_page_config(
-    page_title="ETF板块资金流入扫描器",
-    page_icon="📊",
-    layout="wide"
-)
+st.divider()
+st.header("11. 📊 ETF 板块资金流入扫描")
 
 # 核心板块ETF列表
 SECTOR_ETFS = {
-    'XLK': '科技',
-    'SMH': '半导体',
-    'XLF': '金融',
-    'XLE': '能源',
-    'XLV': '医疗健康',
-    'XBI': '生物科技',
-    'IBB': '生物科技(大盘)',
-    'XLI': '工业',
-    'XLY': '可选消费',
-    'XLP': '必需消费',
-    'XLU': '公用事业',
-    'XLRE': '房地产',
-    'XLB': '材料',
-    'XLC': '通信服务',
-    'IWM': '小盘股',
-    'QQQ': '纳指100',
-    'SPY': 'S&P500',
-    'DIA': '道指30',
+    'XLK': '科技', 'SMH': '半导体', 'XLF': '金融', 'XLE': '能源',
+    'XLV': '医疗健康', 'XBI': '生物科技', 'XLI': '工业', 'XLY': '可选消费',
+    'XLP': '必需消费', 'XLU': '公用事业', 'XLRE': '房地产', 'XLB': '材料',
+    'XLC': '通信服务', 'IWM': '小盘股', 'QQQ': '纳指100', 'SPY': 'S&P500',
 }
 
-
-@st.cache_data(ttl=300)  # 缓存5分钟
-def get_etf_data(ticker: str, period: str = "3mo"):
-    """获取ETF数据"""
+@st.cache_data(ttl=300)
+def get_etf_flow_data(ticker: str, period: str = "3mo"):
+    """获取ETF数据用于资金流分析"""
     try:
         data = yf.download(ticker, period=period, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
         return data
-    except Exception as e:
-        st.error(f"获取 {ticker} 失败: {e}")
+    except:
         return None
 
-
-def calculate_signals(ticker: str, data: pd.DataFrame) -> dict:
+def calculate_etf_signals(ticker: str, data: pd.DataFrame) -> dict:
     """计算单个ETF的资金流入信号"""
     try:
         if data is None or data.empty or len(data) < 25:
             return None
         
-        # 处理MultiIndex columns
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        
         df = data.copy()
-        
-        # 计算指标
         df['SMA20'] = df['Close'].rolling(20).mean()
         df['SMA50'] = df['Close'].rolling(50).mean()
         df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
-        
-        # OBV计算
         df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
         
-        # 取最新数据
         latest = df.iloc[-1]
         prev_5d = df.iloc[-5]
         prev_20d = df.iloc[-20] if len(df) >= 20 else df.iloc[0]
         
         close = float(latest['Close'])
         sma20 = float(latest['SMA20'])
-        sma50 = float(latest['SMA50'])
-        volume = float(latest['Volume'])
+        sma50 = float(latest['SMA50']) if not pd.isna(latest['SMA50']) else sma20
         vol_sma20 = float(latest['Vol_SMA20'])
-        obv_now = float(latest['OBV'])
-        obv_5d_ago = float(prev_5d['OBV'])
         
-        # 计算各项信号
         price_above_sma20 = close > sma20
         price_above_sma50 = close > sma50
-        volume_expanding = volume > vol_sma20
-        obv_rising = obv_now > obv_5d_ago
-        
-        # 相对强度：过去20日涨幅
+        volume_expanding = float(latest['Volume']) > vol_sma20
+        obv_rising = float(latest['OBV']) > float(prev_5d['OBV'])
         returns_20d = (close / float(prev_20d['Close']) - 1) * 100
+        vol_ratio = float(latest['Volume']) / vol_sma20 if vol_sma20 > 0 else 1
         
-        # 距离SMA20的百分比
-        dist_from_sma20 = (close / sma20 - 1) * 100
-        
-        # 成交量放大倍数
-        vol_ratio = volume / vol_sma20 if vol_sma20 > 0 else 1
-        
-        # 综合评分 (0-5分)
-        score = 0
-        if price_above_sma20: score += 1
-        if price_above_sma50: score += 1
-        if volume_expanding: score += 1
-        if obv_rising: score += 1
-        if returns_20d > 0: score += 1
+        score = sum([price_above_sma20, price_above_sma50, volume_expanding, obv_rising, returns_20d > 0])
         
         return {
-            'ETF': ticker,
-            '板块': SECTOR_ETFS.get(ticker, ticker),
+            'ETF': ticker, '板块': SECTOR_ETFS.get(ticker, ticker),
             '价格': round(close, 2),
             '>SMA20': '✅' if price_above_sma20 else '❌',
             '>SMA50': '✅' if price_above_sma50 else '❌',
             '放量': '✅' if volume_expanding else '❌',
             'OBV↑': '✅' if obv_rising else '❌',
             '量比': round(vol_ratio, 2),
-            '距SMA20%': round(dist_from_sma20, 2),
             '20日涨幅%': round(returns_20d, 2),
             '评分': score,
         }
-        
-    except Exception as e:
+    except:
         return None
 
+col_etf1, col_etf2 = st.columns([3, 1])
+with col_etf2:
+    min_score_etf = st.slider("最低评分", 0, 5, 4, key="etf_min_score")
 
-def main():
-    st.title("📊 ETF板块资金流入扫描器")
-    st.caption(f"扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+if st.button("🔍 扫描 ETF 资金流向", type="primary"):
+    etf_results = []
+    progress = st.progress(0)
+    etf_list = list(SECTOR_ETFS.keys())
     
-    # 侧边栏设置
-    with st.sidebar:
-        st.header("⚙️ 设置")
-        min_score = st.slider("最低评分筛选", 0, 5, 4)
-        
-        st.markdown("---")
-        st.markdown("""
-        **评分标准 (满分5分):**
-        - 价格 > SMA20 (+1)
-        - 价格 > SMA50 (+1)
-        - 成交量放大 (+1)
-        - OBV上升 (+1)
-        - 20日涨幅 > 0 (+1)
-        """)
+    for i, ticker in enumerate(etf_list):
+        progress.progress((i + 1) / len(etf_list))
+        data = get_etf_flow_data(ticker)
+        if data is not None and not data.empty:
+            result = calculate_etf_signals(ticker, data)
+            if result:
+                etf_results.append(result)
     
-    # 扫描按钮
-    if st.button("🔍 开始扫描", type="primary", use_container_width=True):
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        results = []
-        etf_list = list(SECTOR_ETFS.keys())
-        
-        for i, ticker in enumerate(etf_list):
-            status_text.text(f"正在获取 {ticker} ({SECTOR_ETFS[ticker]})...")
-            progress_bar.progress((i + 1) / len(etf_list))
-            
-            data = get_etf_data(ticker)
-            if data is not None and not data.empty:
-                result = calculate_signals(ticker, data)
-                if result:
-                    results.append(result)
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        if results:
-            df = pd.DataFrame(results)
-            df = df.sort_values('评分', ascending=False)
-            
-            # 显示完整排名
-            st.subheader("📋 全部ETF评分排名")
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                height=400
-            )
-            
-            # 资金流入板块
-            st.subheader(f"🔥 资金流入板块 (评分≥{min_score})")
-            inflow_df = df[df['评分'] >= min_score]
-            
-            if len(inflow_df) > 0:
-                cols = st.columns(len(inflow_df))
-                for i, (_, row) in enumerate(inflow_df.iterrows()):
-                    with cols[i]:
-                        status = "🔥" if row['评分'] == 5 else "✅"
-                        st.metric(
-                            label=f"{status} {row['ETF']}",
-                            value=f"{row['板块']}",
-                            delta=f"{row['20日涨幅%']}%"
-                        )
-            else:
-                st.warning("当前无明显资金流入板块")
-            
-            # 资金流出板块
-            st.subheader("⚠️ 弱势板块 (评分≤2)")
-            outflow_df = df[df['评分'] <= 2]
-            
-            if len(outflow_df) > 0:
-                for _, row in outflow_df.iterrows():
-                    st.write(f"⚠️ **{row['ETF']}** ({row['板块']}): 20日涨幅 {row['20日涨幅%']}%")
-            else:
-                st.success("当前无明显弱势板块")
-            
-            # 下载按钮
-            st.download_button(
-                label="📥 下载CSV",
-                data=df.to_csv(index=False).encode('utf-8-sig'),
-                file_name=f"etf_flow_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
-        else:
-            st.error("未获取到有效数据，请检查网络连接")
+    progress.empty()
     
-    # 使用说明
-    with st.expander("📖 使用说明"):
-        st.markdown("""
-        **操作流程:**
-        1. 点击「开始扫描」获取最新数据
-        2. 查看评分≥4的板块 = 资金正在流入
-        3. 从你筛选的21只股票中，选择属于这些板块的
-        4. 再用SpotGamma Squeeze名单做最后确认
+    if etf_results:
+        etf_df = pd.DataFrame(etf_results).sort_values('评分', ascending=False)
+        st.session_state['etf_scan_results'] = etf_df
         
-        **指标说明:**
-        - **量比**: 今日成交量 / 20日平均成交量
-        - **距SMA20%**: 当前价格偏离SMA20的百分比
-        - **OBV↑**: On-Balance Volume是否上升（资金净流入）
-        """)
+        # 显示结果
+        st.dataframe(etf_df, use_container_width=True, hide_index=True)
+        
+        # 资金流入板块
+        inflow = etf_df[etf_df['评分'] >= min_score_etf]
+        if len(inflow) > 0:
+            st.success(f"🔥 资金流入板块 ({len(inflow)} 个): " + ", ".join(inflow['板块'].tolist()))
+        
+        # 弱势板块
+        weak = etf_df[etf_df['评分'] <= 2]
+        if len(weak) > 0:
+            st.warning(f"⚠️ 弱势板块: " + ", ".join(weak['板块'].tolist()))
+else:
+    if 'etf_scan_results' in st.session_state:
+        st.dataframe(st.session_state['etf_scan_results'], use_container_width=True, hide_index=True)
 
+# ============================================================================
+# 📤 统一导出到 Claude
+# ============================================================================
 
-if __name__ == "__main__":
-    main()
+st.divider()
+st.header("📤 导出完整数据到 Claude")
 
-
+def generate_unified_export():
+    """生成统一的导出文本，包含所有模块数据"""
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
+    export = f"""# 🦅 宏观战情观察室 - 完整数据快照
+生成时间: {timestamp} EST
+
+═══════════════════════════════════════════════════════════════
+## 一、流动性指标
+═══════════════════════════════════════════════════════════════
+- SOFR: {ny_fed['SOFR']:.2f}%
+- Repo (TGCR): {ny_fed['TGCR']:.2f}%
+- SOFR-Repo 利差: {(ny_fed['SOFR'] - ny_fed['TGCR']):.3f}%
+- RRP: ${fed_liq['RRP']:.0f}B (日变化: {fed_liq['RRP_Chg']:.0f}B)
+- TGA: ${fed_liq['TGA']:.0f}B (日变化: {fed_liq['TGA_Chg']:.0f}B)
+- HYG/LQD: {credit[0]:.3f} (日变化: {credit[1]:.2f}%)
+
+═══════════════════════════════════════════════════════════════
+## 二、美债与汇率
+═══════════════════════════════════════════════════════════════
+- 10Y 收益率: {rates['Yield_10Y']:.2f}%
+- 3M 收益率: {rates['Yield_Short']:.2f}%
+- 10Y-3M 利差: {rates['Inversion']:.2f}%
+- MOVE 指数: {rates['MOVE']:.1f}
+- DXY: {rates['DXY']:.2f}
+- USDJPY: {rates['USDJPY']:.2f}
+
+═══════════════════════════════════════════════════════════════
+## 三、恐慌与情绪指标
+═══════════════════════════════════════════════════════════════
+- VIX: {vol['VIX']:.2f}
+- 币圈恐慌贪婪: {vol['Crypto_Val']} ({vol['Crypto_Text']})
+- PCR: {opt['PCR']:.2f}
+
+═══════════════════════════════════════════════════════════════
+## 四、交易微观结构
+═══════════════════════════════════════════════════════════════
+- 期货基差: {deriv['Futures_Basis']:.1f} ({deriv['Basis_Status']})
+- Gamma 环境: {deriv['GEX_Net']}
+- Vanna 状态: {deriv['Vanna_Status']}
+- Put Wall: ${deriv['Put_Wall']:.0f}
+- Call Wall: ${deriv['Call_Wall']:.0f}
+
+═══════════════════════════════════════════════════════════════
+## 五、GEX 分析
+═══════════════════════════════════════════════════════════════
+- 当前价格: ${gex_data['spot_price']:.2f}
+- 净 GEX: {gex_data['total_gex']:.2f}B
+- Gamma Flip Point: ${gex_data['gamma_flip']:.2f}
+- Max Pain: ${gex_data['max_pain']:.2f}
+- GEX Put Wall: ${gex_data['put_wall']:.2f}
+- GEX Call Wall: ${gex_data['call_wall']:.2f}
+
+═══════════════════════════════════════════════════════════════
+## 六、规则引擎信号
+═══════════════════════════════════════════════════════════════
+市场状态: {regime_analysis['regime'].upper()}
+综合评分: {regime_analysis['score']:.1f}
+
+关键信号:
+"""
+    for sig in regime_analysis['signals']:
+        export += f"- [{sig['level']}] {sig['msg']}\n"
+    
+    export += """
+═══════════════════════════════════════════════════════════════
+## 七、重点新闻
+═══════════════════════════════════════════════════════════════
+"""
+    for item in processed_news[:10]:
+        cats = ", ".join(item.get('Categories', ['general']))
+        export += f"- [{cats}] {item['Title']} (情绪: {item.get('Sentiment', 'Neutral')})\n"
+    
+    # 添加 Rotation Score 数据
+    export += """
+═══════════════════════════════════════════════════════════════
+## 八、资金轮动评分 (Rotation Score)
+═══════════════════════════════════════════════════════════════
+"""
+    if 'rotation_results' in st.session_state and st.session_state['rotation_results']:
+        rot = st.session_state['rotation_results']
+        export += f"**综合评分: {rot['total_score']:.1f}** (-100 到 +100)\n\n"
+        for cat_key, cat_data in rot['categories'].items():
+            export += f"### {cat_data['name']} (评分: {cat_data['score']:.1f})\n"
+            for factor in cat_data['factors']:
+                signal = '🟢' if factor['signal'] == 'bullish' else '🔴' if factor['signal'] == 'bearish' else '⚪'
+                export += f"- {signal} {factor['desc']}: Z={factor['z_score']:.2f}\n"
+    else:
+        export += "(请先刷新 Rotation Score 数据)\n"
+    
+    # 添加 Gamma 输入数据
+    export += """
+═══════════════════════════════════════════════════════════════
+## 九、SpotGamma 数据 (手动输入)
+═══════════════════════════════════════════════════════════════
+"""
+    if 'gamma_qqq_data' in st.session_state and st.session_state['gamma_qqq_data'].get('zero_gamma'):
+        g = st.session_state['gamma_qqq_data']
+        export += f"**QQQ**\n"
+        export += f"- Zero Gamma: ${g.get('zero_gamma')}\n"
+        export += f"- Call Wall: ${g.get('call_wall')}\n"
+        export += f"- Put Wall: ${g.get('put_wall')}\n"
+    else:
+        export += "(请在侧边栏输入 SpotGamma 数据)\n"
+    
+    # 添加 ETF 扫描结果
+    export += """
+═══════════════════════════════════════════════════════════════
+## 十、ETF 资金流向扫描
+═══════════════════════════════════════════════════════════════
+"""
+    if 'etf_scan_results' in st.session_state:
+        etf_df = st.session_state['etf_scan_results']
+        strong = etf_df[etf_df['评分'] >= 4]
+        weak = etf_df[etf_df['评分'] <= 2]
+        export += f"**资金流入板块**: {', '.join(strong['板块'].tolist()) if len(strong) > 0 else '无'}\n"
+        export += f"**弱势板块**: {', '.join(weak['板块'].tolist()) if len(weak) > 0 else '无'}\n"
+    else:
+        export += "(请先执行 ETF 扫描)\n"
+    
+    export += """
+═══════════════════════════════════════════════════════════════
+## 分析请求
+═══════════════════════════════════════════════════════════════
+请基于以上完整数据进行深度分析:
+1. 当前市场处于什么宏观周期？流动性环境如何？
+2. Gamma 环境与资金流向是否共振？
+3. 有哪些潜在的风险点需要关注？
+4. 今日 QQQ 期权交易的最佳策略是什么？建议的行权价？
+5. 哪些板块值得重点关注？
+"""
+    return export
+
+with st.expander("📋 点击展开完整数据导出", expanded=False):
+    st.markdown("""
+    <div class="export-box">
+    <p>📋 点击下方文本框，全选 (Ctrl+A) 并复制 (Ctrl+C)，然后粘贴给 Claude 进行深度分析</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    unified_export = generate_unified_export()
+    st.text_area("完整数据快照", unified_export, height=500, key="unified_export")
+
+st.divider()
+st.caption("🦅 宏观战情观察室 v2.0 | 数据来源: NY Fed, Yahoo Finance, SpotGamma | 仅供参考，不构成投资建议")
